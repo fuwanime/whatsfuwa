@@ -4,6 +4,48 @@
 
 > **Status:** MVP interaktif. Source sudah menggunakan Go + `whatsmeow`; proses build dan pairing WhatsApp langsung tetap harus diverifikasi di perangkat pengguna.
 
+## Instalasi
+
+### Linux dan macOS (disarankan)
+
+Butuh `git` dan Go 1.26 atau lebih baru. Lalu jalankan:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/fuwanime/whatsfuwa/main/install.sh | bash
+```
+
+Installer akan:
+
+1. Mengunduh source ke `~/.whatsfuwa/src` (atau memperbaruinya jika sudah ada).
+2. Membangun program ke `~/.local/bin/whatsfuwa`.
+3. Menambahkan `~/.local/bin` ke PATH di `~/.bashrc`, `~/.bash_profile` (macOS), atau `~/.zshrc`, jika belum ada.
+
+Setelah itu, buka terminal baru dan jalankan:
+
+```bash
+whatsfuwa
+```
+
+Opsi yang bisa diatur lewat environment variable:
+
+| Variable | Fungsi | Default |
+| --- | --- | --- |
+| `WHATSFUWA_HOME` | Folder instalasi | `~/.whatsfuwa` |
+| `WHATSFUWA_BIN_DIR` | Folder untuk binary | `~/.local/bin` |
+| `WHATSFUWA_REPO` | URL git sumber | repositori resmi |
+
+Contoh: `WHATSFUWA_BIN_DIR=/usr/local/bin bash install.sh` (perlu hak akses ke folder itu).
+
+### Windows atau instalasi manual
+
+Dengan Go 1.26 atau lebih baru, cara ini berlaku di semua sistem operasi:
+
+```bash
+go install github.com/fuwanime/whatsfuwa/cmd/whatsfuwa@latest
+```
+
+Binary akan berada di folder `GOBIN` (atau `$(go env GOPATH)/bin`). Pastikan folder itu ada di PATH. Perintah `whatsfuwa update` memerlukan source checkout di `~/.whatsfuwa/src`; untuk itu, pakai installer di atas atau jalankan `git clone` manual ke lokasi tersebut.
+
 ## Tampilan dan interaksi
 
 ```text
@@ -130,7 +172,7 @@ Pada peluncuran berikutnya, WhatsFuwa akan memakai sesi yang tersimpan dan tidak
 | Perintah | Fungsi |
 | --- | --- |
 | `whatsfuwa` | Buka aplikasi |
-| `whatsfuwa update` | Jalankan `git pull --ff-only` di folder source, lalu bangun ulang program. Folder source dicari dari `WHATSFUWA_SRC`, folder saat ini, atau folder tempat program berada. Di Windows, build baru disimpan sebagai `whatsfuwa.exe.new` dan harus diganti manual setelah aplikasi ditutup. |
+| `whatsfuwa update` | Jalankan `git pull --ff-only` di folder source, lalu bangun ulang program. Folder source dicari dari `WHATSFUWA_SRC`, `~/.whatsfuwa/src`, folder saat ini, atau folder tempat program berada. Di Windows, build baru disimpan sebagai `whatsfuwa.exe.new` dan harus diganti manual setelah aplikasi ditutup. |
 | `whatsfuwa version` | Tampilkan commit git tempat program dibangun |
 | `whatsfuwa help` | Tampilkan daftar perintah |
 

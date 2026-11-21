@@ -56,6 +56,10 @@ func findSourceDir() (string, error) {
 	if env := os.Getenv("WHATSFUWA_SRC"); env != "" {
 		candidates = append(candidates, env)
 	}
+	// Location used by install.sh.
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, filepath.Join(home, ".whatsfuwa", "src"))
+	}
 	if wd, err := os.Getwd(); err == nil {
 		candidates = append(candidates, wd)
 	}
