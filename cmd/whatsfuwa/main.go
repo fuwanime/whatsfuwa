@@ -18,6 +18,25 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "update":
+			if err := runUpdate(); err != nil {
+				log.Fatal(err)
+			}
+			return
+		case "version", "-v", "--version":
+			printVersion()
+			return
+		case "help", "-h", "--help":
+			printHelp()
+			return
+		default:
+			fmt.Fprintf(os.Stderr, "perintah tidak dikenal: %q\n\n", os.Args[1])
+			printHelp()
+			os.Exit(2)
+		}
+	}
 	if err := run(); err != nil {
 		log.Fatal(err)
 	}

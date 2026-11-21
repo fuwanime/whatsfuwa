@@ -125,6 +125,15 @@ go build -trimpath -ldflags="-s -w" -o whatsfuwa.exe ./cmd/whatsfuwa
 
 Pada peluncuran berikutnya, WhatsFuwa akan memakai sesi yang tersimpan dan tidak meminta QR lagi selama sesi masih tertaut.
 
+## Perintah
+
+| Perintah | Fungsi |
+| --- | --- |
+| `whatsfuwa` | Buka aplikasi |
+| `whatsfuwa update` | Jalankan `git pull --ff-only` di folder source, lalu bangun ulang program. Folder source dicari dari `WHATSFUWA_SRC`, folder saat ini, atau folder tempat program berada. Di Windows, build baru disimpan sebagai `whatsfuwa.exe.new` dan harus diganti manual setelah aplikasi ditutup. |
+| `whatsfuwa version` | Tampilkan commit git tempat program dibangun |
+| `whatsfuwa help` | Tampilkan daftar perintah |
+
 ## Data lokal dan privasi
 
 WhatsFuwa menyimpan data di folder `data/`:
