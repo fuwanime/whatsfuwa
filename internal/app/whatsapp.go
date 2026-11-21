@@ -42,7 +42,7 @@ func (w *WhatsAppClient) Connect(ctx context.Context) error {
 			return fmt.Errorf("menghubungkan WhatsApp: %w", err)
 		}
 
-		fmt.Println("\nWhatsFuwa: scan QR ini lewat WhatsApp > Perangkat tertaut > Tautkan perangkat.\n")
+		fmt.Println("\nWhatsFuwa: scan QR ini lewat WhatsApp > Perangkat tertaut > Tautkan perangkat.")
 		for evt := range qrChan {
 			switch evt.Event {
 			case "code":

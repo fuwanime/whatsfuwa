@@ -486,6 +486,11 @@ func (m tuiModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if msg.Type == tea.KeyCtrlC {
 		return m, tea.Quit
 	}
+	// The space bar arrives as its own key type rather than as a rune, so
+	// normalize it here; otherwise spaces are silently dropped while typing.
+	if msg.Type == tea.KeySpace {
+		msg = tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}}
+	}
 	if msg.Type == tea.KeyEsc {
 		if m.creating {
 			m.creating = false

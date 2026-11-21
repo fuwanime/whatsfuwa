@@ -101,8 +101,12 @@ func (s *ChatStore) AddMessage(message ChatMessage, title string) error {
 	if len(chat.Messages) > maxMessages {
 		chat.Messages = chat.Messages[len(chat.Messages)-maxMessages:]
 	}
-	chat.LastMessage = message.Text
-	chat.UpdatedAt = message.Timestamp
+	// Only a message that is not older than the current latest one may update
+	// the preview; late-arriving history must not roll the chat back in time.
+	if !message.Timestamp.Before(chat.UpdatedAt) {
+		chat.LastMessage = message.Text
+		chat.UpdatedAt = message.Timestamp
+	}
 	s.trimLocked()
 	return s.saveLocked()
 }
