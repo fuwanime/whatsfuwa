@@ -47,7 +47,8 @@ Mouse reporting perlu didukung oleh terminal yang dipakai. Coba Windows Terminal
 | `Enter` | Kirim pesan |
 | `Ctrl+F` | Buka pencarian chat |
 | `Ctrl+N` | Buat chat baru |
-| `Esc` | Tutup mode pencarian atau form chat baru |
+| `Ctrl+R` | Balas pesan masuk terakhir di chat yang dipilih |
+| `Esc` | Batalkan balasan, tutup mode pencarian, atau tutup form chat baru |
 | `PgUp` / `PgDn` | Gulir riwayat pesan |
 | `Tab` | Pindah fokus antara daftar chat dan kolom pesan |
 | `Ctrl+C` | Keluar |
@@ -75,6 +76,9 @@ Memakai Go atau library berbeda **tidak menjamin** semua error dekripsi seperti 
 - Tombol mouse untuk memilih chat, membuat chat, mencari, dan mengirim pesan.
 - Navigasi keyboard sebagai alternatif mouse.
 - Mengirim dan membaca pesan teks.
+- Nama grup ditampilkan otomatis (diambil sekali per grup).
+- Pesan media ditampilkan sebagai label (mis. `📷 Foto`, `📄 Dokumen`) beserta caption bila ada. Media tidak diunduh.
+- Membalas pesan dengan kutipan (`Ctrl+R`), dan melihat kutipan pada balasan yang diterima.
 - Cache lokal dibatasi hingga 80 chat dan 30 pesan per chat.
 - Tidak mengunduh arsip riwayat chat penuh secara otomatis.
 

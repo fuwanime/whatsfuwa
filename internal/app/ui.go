@@ -58,6 +58,8 @@ type tuiModel struct {
 	searchOpen bool
 	creating   bool
 	focus      focusTarget
+	// reply is the message the next sent message will quote, or nil.
+	reply *ChatMessage
 
 	toast      string
 	toastIsErr bool
@@ -328,6 +330,13 @@ func (m tuiModel) renderConversation(width, height int) []string {
 		} else {
 			messageLines = append(messageLines, ansiBold+"  "+truncate(name, maxInt(8, width-10))+ansiReset+ansiDim+"  ·  "+timestamp+ansiReset)
 		}
+		if message.ReplyToID != "" {
+			quoted := previewText(message.ReplyPreview)
+			if quoted == "" {
+				quoted = "pesan sebelumnya"
+			}
+			messageLines = append(messageLines, ansiDim+"  ↪ "+truncate(quoted, maxInt(12, width-8))+ansiReset)
+		}
 		wrapped := wrapText(message.Text, maxInt(12, width-5))
 		for _, line := range wrapped {
 			messageLines = append(messageLines, "  "+line)
@@ -364,6 +373,8 @@ func (m tuiModel) renderComposer(width int) string {
 		label = "  Nomor > "
 		value = m.newChat
 		button = "[ Create ]"
+	} else if reply := m.activeReply(); reply != nil {
+		label = "  ↪ " + truncate(previewText(reply.Text), 24) + " > "
 	}
 	if m.focus == focusComposer || m.focus == focusNewChat {
 		label = ansiCyan + label + ansiReset
@@ -501,6 +512,9 @@ func (m tuiModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.filter = ""
 			m.refreshChats()
 			m.focus = focusList
+		} else if m.reply != nil {
+			m.reply = nil
+			m.setToast("Balasan dibatalkan", false)
 		} else {
 			m.focus = focusComposer
 		}
@@ -579,6 +593,9 @@ func (m tuiModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+n":
 		m.beginNewChat()
 		return m, nil
+	case "ctrl+r":
+		m.startReply()
+		return m, nil
 	}
 	switch msg.Type {
 	case tea.KeyEnter:
@@ -610,14 +627,16 @@ func (m tuiModel) sendCurrent() (tea.Model, tea.Cmd) {
 		m.setToast("WhatsFuwa belum terhubung", true)
 		return m, nil
 	}
+	reply := m.activeReply()
 	m.compose = ""
+	m.reply = nil
 	m.focus = focusComposer
 	m.setToast("Mengirim pesan...", false)
 	ctx := m.ctx
 	return m, func() tea.Msg {
 		sendCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 		defer cancel()
-		err := m.ui.wa.SendText(sendCtx, jid, text)
+		err := m.ui.wa.SendText(sendCtx, jid, text, reply)
 		return sendResultMsg{jid: chat.JID, text: text, err: err}
 	}
 }
@@ -720,6 +739,46 @@ func (m *tuiModel) keepListSelectionVisible() {
 func (m *tuiModel) setToast(value string, isErr bool) {
 	m.toast = value
 	m.toastIsErr = isErr
+}
+
+// startReply makes the newest incoming message in the selected chat the
+// target of the next sent message.
+func (m *tuiModel) startReply() {
+	chat, ok := m.selectedChat()
+	if !ok {
+		m.setToast("Pilih chat terlebih dahulu", true)
+		return
+	}
+	for i := len(chat.Messages) - 1; i >= 0; i-- {
+		message := chat.Messages[i]
+		if message.FromMe || message.ID == "" {
+			continue
+		}
+		target := message
+		m.reply = &target
+		m.focus = focusComposer
+		m.setToast("Membalas pesan. Esc untuk batal.", false)
+		return
+	}
+	m.setToast("Tidak ada pesan masuk untuk dibalas", true)
+}
+
+// activeReply returns the pending reply only when it belongs to the selected
+// chat; switching chats silently drops it.
+func (m tuiModel) activeReply() *ChatMessage {
+	if m.reply == nil {
+		return nil
+	}
+	chat, ok := m.selectedChat()
+	if !ok || chat.JID != m.reply.ChatJID {
+		return nil
+	}
+	return m.reply
+}
+
+// previewText collapses whitespace and newlines so a quote fits on one line.
+func previewText(value string) string {
+	return strings.Join(strings.Fields(value), " ")
 }
 
 func scheduleRefresh() tea.Cmd {

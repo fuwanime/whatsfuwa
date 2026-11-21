@@ -21,9 +21,14 @@ type ChatMessage struct {
 	ID        string    `json:"id"`
 	ChatJID   string    `json:"chat_jid"`
 	Sender    string    `json:"sender,omitempty"`
+	SenderJID string    `json:"sender_jid,omitempty"`
 	Text      string    `json:"text"`
 	Timestamp time.Time `json:"timestamp"`
 	FromMe    bool      `json:"from_me"`
+	// ReplyToID is the ID of the message this one replies to, and
+	// ReplyPreview is a short copy of that message's text for display.
+	ReplyToID    string `json:"reply_to_id,omitempty"`
+	ReplyPreview string `json:"reply_preview,omitempty"`
 }
 
 type Chat struct {
@@ -127,6 +132,19 @@ func (s *ChatStore) AddChat(jid, title string) {
 	}
 	s.trimLocked()
 	_ = s.saveLocked()
+}
+
+// SetTitle renames an existing chat. It does nothing if the chat is not cached,
+// so it never creates a chat with a made-up timestamp.
+func (s *ChatStore) SetTitle(jid, title string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	chat := s.chats[jid]
+	if chat == nil || title == "" || chat.Title == title {
+		return nil
+	}
+	chat.Title = title
+	return s.saveLocked()
 }
 
 func (s *ChatStore) Chats() []Chat {

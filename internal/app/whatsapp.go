@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/mdp/qrterminal/v3"
 	"go.mau.fi/whatsmeow"
@@ -21,6 +23,9 @@ type WhatsAppClient struct {
 	Client *whatsmeow.Client
 	store  *ChatStore
 	ready  atomic.Bool
+	// namedGroups records group JIDs whose name has already been requested
+	// this session, so each group is looked up at most once.
+	namedGroups sync.Map
 }
 
 func NewWhatsAppClient(device *store.Device, logger waLog.Logger, chatStore *ChatStore) *WhatsAppClient {
@@ -81,7 +86,9 @@ func (w *WhatsAppClient) IsConnected() bool {
 	return w.ready.Load() || w.Client.IsConnected()
 }
 
-func (w *WhatsAppClient) SendText(ctx context.Context, jid types.JID, text string) error {
+// SendText sends a text message. When reply is non-nil, the message quotes
+// that earlier message.
+func (w *WhatsAppClient) SendText(ctx context.Context, jid types.JID, text string, reply *ChatMessage) error {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return fmt.Errorf("pesan tidak boleh kosong")
@@ -89,18 +96,43 @@ func (w *WhatsAppClient) SendText(ctx context.Context, jid types.JID, text strin
 	if !w.Client.IsConnected() {
 		return fmt.Errorf("WhatsFuwa belum terhubung ke WhatsApp")
 	}
-	resp, err := w.Client.SendMessage(ctx, jid, &waE2E.Message{
-		Conversation: proto.String(text),
-	})
+
+	message := &waE2E.Message{Conversation: proto.String(text)}
+	replyID, replyPreview := "", ""
+	if reply != nil && reply.ID != "" {
+		participant := reply.SenderJID
+		if participant == "" {
+			participant = jid.String()
+		}
+		info := &waE2E.ContextInfo{
+			StanzaID:    proto.String(reply.ID),
+			Participant: proto.String(participant),
+		}
+		if reply.Text != "" {
+			info.QuotedMessage = &waE2E.Message{Conversation: proto.String(reply.Text)}
+		}
+		message = &waE2E.Message{
+			ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+				Text:        proto.String(text),
+				ContextInfo: info,
+			},
+		}
+		replyID = reply.ID
+		replyPreview = reply.Text
+	}
+
+	resp, err := w.Client.SendMessage(ctx, jid, message)
 	if err != nil {
 		return err
 	}
 	return w.store.AddMessage(ChatMessage{
-		ID:        string(resp.ID),
-		ChatJID:   jid.String(),
-		Text:      text,
-		Timestamp: resp.Timestamp,
-		FromMe:    true,
+		ID:           string(resp.ID),
+		ChatJID:      jid.String(),
+		Text:         text,
+		Timestamp:    resp.Timestamp,
+		FromMe:       true,
+		ReplyToID:    replyID,
+		ReplyPreview: replyPreview,
 	}, "")
 }
 
@@ -117,8 +149,12 @@ func (w *WhatsAppClient) handleEvent(raw any) {
 			return
 		}
 		text := messageText(evt.Message)
-		if text == "" {
-			text = nonTextLabel(evt.Info.MediaType)
+		if label := mediaLabel(evt.Info.MediaType); label != "" {
+			if text == "" {
+				text = label
+			} else {
+				text = label + " · " + text
+			}
 		}
 		if text == "" {
 			return
@@ -129,16 +165,43 @@ func (w *WhatsAppClient) handleEvent(raw any) {
 			sender = title
 			title = "" // PushName adalah nama pengirim, bukan nama grup.
 		}
+		replyID, replyPreview := replyInfo(evt.Message)
 		err := w.store.AddMessage(ChatMessage{
-			ID:        string(evt.Info.ID),
-			ChatJID:   evt.Info.Chat.String(),
-			Sender:    sender,
-			Text:      text,
-			Timestamp: evt.Info.Timestamp,
-			FromMe:    evt.Info.IsFromMe,
+			ID:           string(evt.Info.ID),
+			ChatJID:      evt.Info.Chat.String(),
+			Sender:       sender,
+			SenderJID:    evt.Info.Sender.String(),
+			Text:         text,
+			Timestamp:    evt.Info.Timestamp,
+			FromMe:       evt.Info.IsFromMe,
+			ReplyToID:    replyID,
+			ReplyPreview: replyPreview,
 		}, title)
 		_ = err // The TUI refreshes the bounded local cache periodically.
+		if evt.Info.IsGroup {
+			w.ensureGroupName(evt.Info.Chat)
+		}
 	}
+}
+
+// ensureGroupName fetches a group's name in the background, once per session.
+// It runs after the message is stored so the chat already exists.
+func (w *WhatsAppClient) ensureGroupName(jid types.JID) {
+	key := jid.String()
+	if _, loaded := w.namedGroups.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		info, err := w.Client.GetGroupInfo(ctx, jid)
+		if err != nil || info == nil || info.Name == "" {
+			// Allow a retry on the next message from this group.
+			w.namedGroups.Delete(key)
+			return
+		}
+		_ = w.store.SetTitle(key, info.Name)
+	}()
 }
 
 func messageText(msg *waE2E.Message) string {
@@ -163,9 +226,52 @@ func messageText(msg *waE2E.Message) string {
 	return ""
 }
 
-func nonTextLabel(mediaType string) string {
-	if mediaType == "" {
-		return ""
+// replyInfo returns the ID of the message this one quotes and a short preview
+// of it, or empty strings when the message is not a reply.
+func replyInfo(msg *waE2E.Message) (string, string) {
+	info := contextInfo(msg)
+	if info == nil {
+		return "", ""
 	}
-	return "[" + strings.ToLower(mediaType) + "]"
+	preview := ""
+	if quoted := info.GetQuotedMessage(); quoted != nil {
+		preview = messageText(quoted)
+	}
+	return info.GetStanzaID(), preview
+}
+
+func contextInfo(msg *waE2E.Message) *waE2E.ContextInfo {
+	switch {
+	case msg.GetExtendedTextMessage() != nil:
+		return msg.GetExtendedTextMessage().GetContextInfo()
+	case msg.GetImageMessage() != nil:
+		return msg.GetImageMessage().GetContextInfo()
+	case msg.GetVideoMessage() != nil:
+		return msg.GetVideoMessage().GetContextInfo()
+	case msg.GetDocumentMessage() != nil:
+		return msg.GetDocumentMessage().GetContextInfo()
+	}
+	return nil
+}
+
+// mediaLabel turns WhatsApp's media type into a short label for the chat view.
+func mediaLabel(mediaType string) string {
+	switch strings.ToLower(mediaType) {
+	case "":
+		return ""
+	case "image":
+		return "📷 Foto"
+	case "video", "gif":
+		return "🎥 Video"
+	case "audio":
+		return "🎵 Audio"
+	case "ptt":
+		return "🎤 Pesan suara"
+	case "document":
+		return "📄 Dokumen"
+	case "sticker":
+		return "🏷 Stiker"
+	default:
+		return "[" + strings.ToLower(mediaType) + "]"
+	}
 }
