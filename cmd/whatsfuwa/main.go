@@ -1,0 +1,88 @@
+package main
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+	"time"
+
+	"github.com/fuwanime/whatsfuwa/internal/app"
+	"go.mau.fi/whatsmeow/store/sqlstore"
+	waLog "go.mau.fi/whatsmeow/util/log"
+	_ "modernc.org/sqlite"
+)
+
+func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
+	dataDir := "data"
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		return fmt.Errorf("buat folder data: %w", err)
+	}
+	_ = os.Chmod(dataDir, 0o700)
+
+	dbPath := filepath.Join(dataDir, "session.db")
+	// modernc.org/sqlite registers the pure-Go driver as "sqlite". whatsmeow
+	// still receives its own SQLite dialect name ("sqlite3") for SQL generation.
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dbPath)+"?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	if err != nil {
+		return fmt.Errorf("buka database sesi: %w", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	container := sqlstore.NewWithDB(db, "sqlite3", nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := container.Upgrade(ctx); err != nil {
+		return fmt.Errorf("inisialisasi database sesi: %w", err)
+	}
+	defer container.Close()
+	_ = os.Chmod(dbPath, 0o600)
+
+	device, err := container.GetFirstDevice(ctx)
+	if err != nil {
+		return fmt.Errorf("memuat sesi WhatsApp: %w", err)
+	}
+
+	chatStore, err := app.OpenChatStore(filepath.Join(dataDir, "chats.json"))
+	if err != nil {
+		return fmt.Errorf("membuka cache chat: %w", err)
+	}
+
+	clientLog := waLog.Stdout("WhatsFuwa", "WARN", true)
+	waClient := app.NewWhatsAppClient(device, clientLog, chatStore)
+	waClient.Client.EnableAutoReconnect = true
+	waClient.Client.InitialAutoReconnect = true
+	// Jangan unduh arsip chat penuh saat login. Ini menghemat bandwidth,
+	// ruang penyimpanan, dan lonjakan memori di laptop lama.
+	waClient.Client.ManualHistorySyncDownload = true
+	// Minta ulang pesan yang gagal diterima dari perangkat utama bila diperlukan.
+	waClient.Client.AutomaticMessageRerequestFromPhone = true
+
+	ctxSignal, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := waClient.Connect(ctxSignal); err != nil {
+		return err
+	}
+
+	ui := app.NewUI(waClient, chatStore)
+	if err := ui.Run(ctxSignal); err != nil {
+		return err
+	}
+
+	waClient.Disconnect()
+	_ = chatStore.Save()
+	return nil
+}
