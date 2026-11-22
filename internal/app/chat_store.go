@@ -66,9 +66,7 @@ func OpenChatStore(path string) (*ChatStore, error) {
 	}
 	for _, chat := range saved.Chats {
 		copyChat := chat
-		if len(copyChat.Messages) > maxMessages {
-			copyChat.Messages = copyChat.Messages[len(copyChat.Messages)-maxMessages:]
-		}
+		normalizeChatMessages(&copyChat)
 		store.chats[copyChat.JID] = &copyChat
 	}
 	store.trimLocked()
@@ -103,22 +101,29 @@ func (s *ChatStore) AddMessage(message ChatMessage, title string) error {
 		}
 	}
 	chat.Messages = append(chat.Messages, message)
-	if len(chat.Messages) > maxMessages {
-		chat.Messages = chat.Messages[len(chat.Messages)-maxMessages:]
-	}
-	// Only a message that is not older than the current latest one may update
-	// the preview; late-arriving history must not roll the chat back in time.
-	if !message.Timestamp.Before(chat.UpdatedAt) {
-		chat.LastMessage = message.Text
-		chat.UpdatedAt = message.Timestamp
-	}
+	normalizeChatMessages(chat)
 	s.trimLocked()
 	return s.saveLocked()
 }
 
-func (s *ChatStore) AddChat(jid, title string) {
-	if jid == "" {
+func normalizeChatMessages(chat *Chat) {
+	sort.SliceStable(chat.Messages, func(i, j int) bool {
+		return chat.Messages[i].Timestamp.Before(chat.Messages[j].Timestamp)
+	})
+	if len(chat.Messages) > maxMessages {
+		chat.Messages = chat.Messages[len(chat.Messages)-maxMessages:]
+	}
+	if len(chat.Messages) == 0 {
 		return
+	}
+	newest := chat.Messages[len(chat.Messages)-1]
+	chat.LastMessage = newest.Text
+	chat.UpdatedAt = newest.Timestamp
+}
+
+func (s *ChatStore) AddChat(jid, title string) error {
+	if jid == "" {
+		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -131,7 +136,7 @@ func (s *ChatStore) AddChat(jid, title string) {
 		chat.Title = title
 	}
 	s.trimLocked()
-	_ = s.saveLocked()
+	return s.saveLocked()
 }
 
 // SetTitle renames an existing chat. It does nothing if the chat is not cached,
@@ -157,9 +162,16 @@ func (s *ChatStore) Chats() []Chat {
 		result = append(result, copyChat)
 	}
 	sort.Slice(result, func(i, j int) bool {
-		return result[i].UpdatedAt.After(result[j].UpdatedAt)
+		return chatPrecedes(result[i], result[j])
 	})
 	return result
+}
+
+func chatPrecedes(a, b Chat) bool {
+	if a.UpdatedAt.Equal(b.UpdatedAt) {
+		return a.JID < b.JID
+	}
+	return a.UpdatedAt.After(b.UpdatedAt)
 }
 
 func (s *ChatStore) Find(query string) []Chat {
@@ -192,7 +204,7 @@ func (s *ChatStore) saveLocked() error {
 		file.Chats = append(file.Chats, *chat)
 	}
 	sort.Slice(file.Chats, func(i, j int) bool {
-		return file.Chats[i].UpdatedAt.After(file.Chats[j].UpdatedAt)
+		return chatPrecedes(file.Chats[i], file.Chats[j])
 	})
 	data, err := json.MarshalIndent(file, "", "  ")
 	if err != nil {
@@ -214,7 +226,7 @@ func (s *ChatStore) trimLocked() {
 		ordered = append(ordered, chat)
 	}
 	sort.Slice(ordered, func(i, j int) bool {
-		return ordered[i].UpdatedAt.After(ordered[j].UpdatedAt)
+		return chatPrecedes(*ordered[i], *ordered[j])
 	})
 	for _, chat := range ordered[maxChats:] {
 		delete(s.chats, chat.JID)

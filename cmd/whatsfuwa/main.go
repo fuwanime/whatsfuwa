@@ -42,8 +42,22 @@ func main() {
 	}
 }
 
+func dataDirectory() (string, error) {
+	if dir := os.Getenv("WHATSFUWA_DATA_DIR"); dir != "" {
+		return dir, nil
+	}
+	base, err := os.UserConfigDir()
+	if err != nil {
+		return "", fmt.Errorf("menemukan folder konfigurasi: %w", err)
+	}
+	return filepath.Join(base, "whatsfuwa"), nil
+}
+
 func run() error {
-	dataDir := "data"
+	dataDir, err := dataDirectory()
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return fmt.Errorf("buat folder data: %w", err)
 	}
@@ -102,6 +116,8 @@ func run() error {
 	}
 
 	waClient.Disconnect()
-	_ = chatStore.Save()
+	if err := chatStore.Save(); err != nil {
+		return fmt.Errorf("menyimpan cache chat: %w", err)
+	}
 	return nil
 }

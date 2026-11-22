@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync"
@@ -22,6 +23,7 @@ import (
 type WhatsAppClient struct {
 	Client *whatsmeow.Client
 	store  *ChatStore
+	logger waLog.Logger
 	ready  atomic.Bool
 	// namedGroups records group JIDs whose name has already been requested
 	// this session, so each group is looked up at most once.
@@ -32,6 +34,7 @@ func NewWhatsAppClient(device *store.Device, logger waLog.Logger, chatStore *Cha
 	wa := &WhatsAppClient{
 		Client: whatsmeow.NewClient(device, logger),
 		store:  chatStore,
+		logger: logger,
 	}
 	wa.Client.AddEventHandler(wa.handleEvent)
 	return wa
@@ -48,33 +51,43 @@ func (w *WhatsAppClient) Connect(ctx context.Context) error {
 		}
 
 		fmt.Println("\nWhatsFuwa: scan QR ini lewat WhatsApp > Perangkat tertaut > Tautkan perangkat.")
-		for evt := range qrChan {
-			switch evt.Event {
-			case "code":
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-			case "success":
-				fmt.Println("\nLogin berhasil. WhatsFuwa tersambung.")
-			case "timeout":
-				fmt.Println("QR kedaluwarsa. WhatsFuwa akan mencoba lagi saat koneksi tersedia.")
-			case "error":
-				if evt.Error != nil {
-					return fmt.Errorf("login WhatsApp gagal: %w", evt.Error)
-				}
-			case "err-client-outdated":
-				return fmt.Errorf("versi protokol WhatsApp perlu diperbarui; update WhatsFuwa")
-			case "err-scanned-without-multidevice":
-				return fmt.Errorf("akun belum mengaktifkan fitur multi-perangkat")
-			default:
-				fmt.Printf("Status pairing: %s\n", evt.Event)
-			}
-		}
-		return nil
+		return waitForQRLogin(qrChan, os.Stdout)
 	}
 
 	if err := w.Client.ConnectContext(ctx); err != nil {
 		return fmt.Errorf("menghubungkan sesi tersimpan: %w", err)
 	}
 	fmt.Println("Sesi ditemukan. Menghubungkan kembali...")
+	return nil
+}
+
+func waitForQRLogin(qrChan <-chan whatsmeow.QRChannelItem, output io.Writer) error {
+	succeeded := false
+	for evt := range qrChan {
+		switch evt.Event {
+		case "code":
+			qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, output)
+		case "success":
+			succeeded = true
+			fmt.Fprintln(output, "\nLogin berhasil. WhatsFuwa tersambung.")
+		case "timeout":
+			return fmt.Errorf("QR kedaluwarsa; jalankan WhatsFuwa kembali untuk login")
+		case "error":
+			if evt.Error != nil {
+				return fmt.Errorf("login WhatsApp gagal: %w", evt.Error)
+			}
+			return fmt.Errorf("login WhatsApp gagal")
+		case "err-client-outdated":
+			return fmt.Errorf("versi protokol WhatsApp perlu diperbarui; update WhatsFuwa")
+		case "err-scanned-without-multidevice":
+			return fmt.Errorf("akun belum mengaktifkan fitur multi-perangkat")
+		default:
+			fmt.Fprintf(output, "Status pairing: %s\n", evt.Event)
+		}
+	}
+	if !succeeded {
+		return fmt.Errorf("login WhatsApp berakhir sebelum berhasil")
+	}
 	return nil
 }
 
@@ -87,16 +100,23 @@ func (w *WhatsAppClient) IsConnected() bool {
 }
 
 // SendText sends a text message. When reply is non-nil, the message quotes
-// that earlier message.
-func (w *WhatsAppClient) SendText(ctx context.Context, jid types.JID, text string, reply *ChatMessage) error {
+// that earlier message. sent remains true when only the local cache write fails.
+func (w *WhatsAppClient) SendText(ctx context.Context, jid types.JID, text string, reply *ChatMessage) (sent bool, err error) {
 	text = strings.TrimSpace(text)
 	if text == "" {
-		return fmt.Errorf("pesan tidak boleh kosong")
+		return false, fmt.Errorf("pesan tidak boleh kosong")
 	}
 	if !w.Client.IsConnected() {
-		return fmt.Errorf("WhatsFuwa belum terhubung ke WhatsApp")
+		return false, fmt.Errorf("WhatsFuwa belum terhubung ke WhatsApp")
 	}
+	return deliverText(ctx, w.store, jid, text, reply, func(ctx context.Context, jid types.JID, message *waE2E.Message) (whatsmeow.SendResponse, error) {
+		return w.Client.SendMessage(ctx, jid, message)
+	})
+}
 
+type sendMessageFunc func(context.Context, types.JID, *waE2E.Message) (whatsmeow.SendResponse, error)
+
+func deliverText(ctx context.Context, store *ChatStore, jid types.JID, text string, reply *ChatMessage, send sendMessageFunc) (bool, error) {
 	message := &waE2E.Message{Conversation: proto.String(text)}
 	replyID, replyPreview := "", ""
 	if reply != nil && reply.ID != "" {
@@ -121,11 +141,11 @@ func (w *WhatsAppClient) SendText(ctx context.Context, jid types.JID, text strin
 		replyPreview = reply.Text
 	}
 
-	resp, err := w.Client.SendMessage(ctx, jid, message)
+	resp, err := send(ctx, jid, message)
 	if err != nil {
-		return err
+		return false, err
 	}
-	return w.store.AddMessage(ChatMessage{
+	if err := store.AddMessage(ChatMessage{
 		ID:           string(resp.ID),
 		ChatJID:      jid.String(),
 		Text:         text,
@@ -133,7 +153,10 @@ func (w *WhatsAppClient) SendText(ctx context.Context, jid types.JID, text strin
 		FromMe:       true,
 		ReplyToID:    replyID,
 		ReplyPreview: replyPreview,
-	}, "")
+	}, ""); err != nil {
+		return true, fmt.Errorf("menyimpan cache pesan terkirim: %w", err)
+	}
+	return true, nil
 }
 
 func (w *WhatsAppClient) handleEvent(raw any) {
@@ -177,7 +200,7 @@ func (w *WhatsAppClient) handleEvent(raw any) {
 			ReplyToID:    replyID,
 			ReplyPreview: replyPreview,
 		}, title)
-		_ = err // The TUI refreshes the bounded local cache periodically.
+		w.logCacheError(err)
 		if evt.Info.IsGroup {
 			w.ensureGroupName(evt.Info.Chat)
 		}
@@ -200,8 +223,14 @@ func (w *WhatsAppClient) ensureGroupName(jid types.JID) {
 			w.namedGroups.Delete(key)
 			return
 		}
-		_ = w.store.SetTitle(key, info.Name)
+		w.logCacheError(w.store.SetTitle(key, info.Name))
 	}()
+}
+
+func (w *WhatsAppClient) logCacheError(err error) {
+	if err != nil && w.logger != nil {
+		w.logger.Errorf("gagal menyimpan cache chat: %v", err)
+	}
 }
 
 func messageText(msg *waE2E.Message) string {

@@ -6,9 +6,11 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/mattn/go-runewidth"
 	"go.mau.fi/whatsmeow/types"
 )
 
@@ -59,7 +61,8 @@ type tuiModel struct {
 	creating   bool
 	focus      focusTarget
 	// reply is the message the next sent message will quote, or nil.
-	reply *ChatMessage
+	reply         *ChatMessage
+	pendingDrafts map[string]sendResultMsg
 
 	toast      string
 	toastIsErr bool
@@ -68,9 +71,11 @@ type tuiModel struct {
 type refreshMsg time.Time
 
 type sendResultMsg struct {
-	jid  string
-	text string
-	err  error
+	jid   string
+	text  string
+	reply *ChatMessage
+	sent  bool
+	err   error
 }
 
 func NewUI(wa *WhatsAppClient, store *ChatStore) *UI {
@@ -129,12 +134,17 @@ func (m tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m, scheduleRefresh()
 
 	case sendResultMsg:
-		if msg.err != nil {
+		if !msg.sent {
+			m.restoreDraft(msg)
 			m.setToast("Gagal mengirim: "+msg.err.Error(), true)
+			return m, nil
+		}
+		m.scrollOffset = 0
+		m.refreshChats()
+		if msg.err != nil {
+			m.setToast("Pesan terkirim, tetapi gagal menyimpan cache: "+msg.err.Error(), true)
 		} else {
 			m.setToast("Pesan terkirim", false)
-			m.scrollOffset = 0
-			m.refreshChats()
 		}
 		return m, nil
 
@@ -145,6 +155,34 @@ func (m tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKey(msg)
 	}
 	return m, nil
+}
+
+func (m *tuiModel) restoreDraft(msg sendResultMsg) {
+	if m.selectedJID != msg.jid {
+		if m.pendingDrafts == nil {
+			m.pendingDrafts = make(map[string]sendResultMsg)
+		}
+		if previous, ok := m.pendingDrafts[msg.jid]; ok {
+			msg.text += "\n" + previous.text
+		}
+		m.pendingDrafts[msg.jid] = msg
+		return
+	}
+	if m.compose == "" {
+		m.compose = msg.text
+	} else if msg.text != "" {
+		m.compose = msg.text + "\n" + m.compose
+	}
+	m.reply = msg.reply
+}
+
+func (m *tuiModel) restorePendingDraft() {
+	msg, ok := m.pendingDrafts[m.selectedJID]
+	if !ok {
+		return
+	}
+	delete(m.pendingDrafts, m.selectedJID)
+	m.restoreDraft(msg)
 }
 
 func (m tuiModel) View() string {
@@ -256,14 +294,9 @@ func (m tuiModel) renderChatList(width, height int) []string {
 		return padRows(rows, height)
 	}
 
-	start := m.listOffset
-	if start < 0 {
-		start = 0
-	}
-	if start >= len(chats) {
-		start = maxInt(0, len(chats)-1)
-	}
+	start := maxInt(0, m.listOffset)
 	visibleCount := (height + 1) / 2
+	start = minInt(start, maxInt(0, len(chats)-visibleCount))
 	end := minInt(len(chats), start+visibleCount)
 	for index := start; index < end; index++ {
 		chat := chats[index]
@@ -316,6 +349,23 @@ func (m tuiModel) renderConversation(width, height int) []string {
 		return padRows(rows, height)
 	}
 
+	messageLines := conversationLines(chat, width)
+	maxOffset := maxConversationOffset(len(messageLines), height)
+	offset := minInt(maxOffset, maxInt(0, m.scrollOffset))
+	visibleHeight := height
+	if offset > 0 {
+		visibleHeight = maxInt(1, height-1)
+	}
+	end := len(messageLines) - offset
+	start := maxInt(0, end-visibleHeight)
+	visible := append([]string(nil), messageLines[start:end]...)
+	if offset > 0 {
+		visible = append([]string{ansiDim + "  ↑ Riwayat pesan lebih lama (PgUp / scroll)" + ansiReset}, visible...)
+	}
+	return padRows(visible, height)
+}
+
+func conversationLines(chat Chat, width int) []string {
 	messageLines := make([]string, 0, len(chat.Messages)*3)
 	for _, message := range chat.Messages {
 		name := message.Sender
@@ -346,23 +396,29 @@ func (m tuiModel) renderConversation(width, height int) []string {
 	if len(messageLines) == 0 {
 		messageLines = append(messageLines, "", "  Belum ada pesan yang tersimpan.", "  Tulis pesan di bawah untuk memulai.")
 	}
+	return messageLines
+}
 
-	end := len(messageLines) - m.scrollOffset
-	if end < 0 {
-		end = 0
+func (m tuiModel) maxScrollOffset() int {
+	chat, ok := m.selectedChat()
+	if !ok {
+		return 0
 	}
-	start := end - height
-	if start < 0 {
-		start = 0
+	width := maxInt(76, m.width)
+	height := maxInt(3, maxInt(18, m.height)-8)
+	lines := conversationLines(chat, width-leftWidthFor(width)-3)
+	return maxConversationOffset(len(lines), height)
+}
+
+func maxConversationOffset(lineCount, height int) int {
+	if lineCount <= height {
+		return 0
 	}
-	visible := append([]string(nil), messageLines[start:end]...)
-	if m.scrollOffset > 0 {
-		visible = append([]string{ansiDim + "  ↑ Riwayat pesan lebih lama (PgUp / scroll)" + ansiReset}, visible...)
-		if len(visible) > height {
-			visible = visible[len(visible)-height:]
-		}
-	}
-	return padRows(visible, height)
+	return lineCount - height + 1
+}
+
+func (m *tuiModel) scrollBy(delta int) {
+	m.scrollOffset = minInt(m.maxScrollOffset(), maxInt(0, m.scrollOffset+delta))
 }
 
 func (m tuiModel) renderComposer(width int) string {
@@ -406,7 +462,7 @@ func (m tuiModel) renderStatus(width int) string {
 		if m.toastIsErr {
 			color = ansiRed
 		}
-		message = "  " + color + m.toast + ansiReset
+		message = "  " + color + sanitizeText(m.toast) + ansiReset
 	}
 	return fitANSI(ansiDim+message+ansiReset, width)
 }
@@ -434,17 +490,19 @@ func (m tuiModel) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.X >= leftWidth && msg.Y >= contentTop && msg.Y < footerDivider {
-			m.scrollOffset += 3
+			m.scrollBy(3)
 			return m, nil
 		}
 	}
 	if msg.Button == tea.MouseButtonWheelDown {
 		if msg.X < leftWidth && msg.Y >= contentTop && msg.Y < footerDivider {
-			m.listOffset = minInt(maxInt(0, len(m.visibleChats())-1), m.listOffset+2)
+			visibleCount := (contentHeight + 1) / 2
+			maxOffset := maxInt(0, len(m.visibleChats())-visibleCount)
+			m.listOffset = minInt(maxOffset, m.listOffset+2)
 			return m, nil
 		}
 		if msg.X >= leftWidth && msg.Y >= contentTop && msg.Y < footerDivider {
-			m.scrollOffset = maxInt(0, m.scrollOffset-3)
+			m.scrollBy(-3)
 			return m, nil
 		}
 	}
@@ -458,21 +516,27 @@ func (m tuiModel) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		case relative < len("[ + New ]"):
 			m.beginNewChat()
 		case relative < len("[ + New ] [ / Search ]"):
-			m.searchOpen = true
-			m.focus = focusSearch
+			m.beginSearch()
 		default:
 			return m, tea.Quit
 		}
 		return m, nil
 	}
 	if msg.Y >= contentTop && msg.Y < footerDivider && msg.X < leftWidth {
-		index := m.listOffset + (msg.Y-contentTop)/2
 		chats := m.visibleChats()
+		visibleCount := (contentHeight + 1) / 2
+		maxOffset := maxInt(0, len(chats)-visibleCount)
+		m.listOffset = minInt(maxOffset, maxInt(0, m.listOffset))
+		index := m.listOffset + (msg.Y-contentTop)/2
 		if index >= 0 && index < len(chats) {
 			m.selectedJID = chats[index].JID
-			m.selectedIdx = index
+			m.creating = false
+			m.newChat = ""
+			m.searchOpen = false
+			m.filter = ""
 			m.scrollOffset = 0
 			m.focus = focusComposer
+			m.refreshChats()
 		}
 		return m, nil
 	}
@@ -501,6 +565,14 @@ func (m tuiModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// normalize it here; otherwise spaces are silently dropped while typing.
 	if msg.Type == tea.KeySpace {
 		msg = tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}}
+	}
+	switch msg.String() {
+	case "ctrl+f":
+		m.beginSearch()
+		return m, nil
+	case "ctrl+n":
+		m.beginNewChat()
+		return m, nil
 	}
 	if msg.Type == tea.KeyEsc {
 		if m.creating {
@@ -538,11 +610,11 @@ func (m tuiModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if msg.Type == tea.KeyPgUp {
-		m.scrollOffset += maxInt(3, m.height/2)
+		m.scrollBy(maxInt(3, m.height/2))
 		return m, nil
 	}
 	if msg.Type == tea.KeyPgDown {
-		m.scrollOffset = maxInt(0, m.scrollOffset-maxInt(3, m.height/2))
+		m.scrollBy(-maxInt(3, m.height/2))
 		return m, nil
 	}
 	if msg.Type == tea.KeyTab {
@@ -586,13 +658,6 @@ func (m tuiModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch msg.String() {
-	case "ctrl+f":
-		m.searchOpen = true
-		m.focus = focusSearch
-		return m, nil
-	case "ctrl+n":
-		m.beginNewChat()
-		return m, nil
 	case "ctrl+r":
 		m.startReply()
 		return m, nil
@@ -636,8 +701,8 @@ func (m tuiModel) sendCurrent() (tea.Model, tea.Cmd) {
 	return m, func() tea.Msg {
 		sendCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 		defer cancel()
-		err := m.ui.wa.SendText(sendCtx, jid, text, reply)
-		return sendResultMsg{jid: chat.JID, text: text, err: err}
+		sent, err := m.ui.wa.SendText(sendCtx, jid, text, reply)
+		return sendResultMsg{jid: chat.JID, text: text, reply: reply, sent: sent, err: err}
 	}
 }
 
@@ -648,7 +713,7 @@ func (m *tuiModel) createChat() {
 		return
 	}
 	jid := types.NewJID(phone, types.DefaultUserServer)
-	m.ui.store.AddChat(jid.String(), "")
+	cacheErr := m.ui.store.AddChat(jid.String(), "")
 	m.selectedJID = jid.String()
 	m.newChat = ""
 	m.creating = false
@@ -657,17 +722,31 @@ func (m *tuiModel) createChat() {
 	m.scrollOffset = 0
 	m.focus = focusComposer
 	m.refreshChats()
+	if cacheErr != nil {
+		m.setToast("Chat baru siap, tetapi gagal menyimpan cache: "+cacheErr.Error(), true)
+		return
+	}
 	m.setToast("Chat baru siap. Tulis pesan di bawah.", false)
+}
+
+func (m *tuiModel) beginSearch() {
+	m.creating = false
+	m.newChat = ""
+	m.searchOpen = true
+	m.focus = focusSearch
 }
 
 func (m *tuiModel) beginNewChat() {
 	m.creating = true
 	m.newChat = ""
 	m.searchOpen = false
+	m.filter = ""
 	m.focus = focusNewChat
+	m.refreshChats()
 }
 
 func (m *tuiModel) refreshChats() {
+	defer m.restorePendingDraft()
 	previous := m.selectedJID
 	m.chats = m.ui.store.Find(m.filter)
 	if len(m.chats) == 0 {
@@ -724,7 +803,8 @@ func (m *tuiModel) moveSelection(delta int) {
 }
 
 func (m *tuiModel) keepListSelectionVisible() {
-	visible := maxInt(1, (maxInt(18, m.height)-8)/2)
+	contentHeight := maxInt(3, maxInt(18, m.height)-8)
+	visible := maxInt(1, (contentHeight+1)/2)
 	if m.selectedIdx < m.listOffset {
 		m.listOffset = m.selectedIdx
 	}
@@ -778,7 +858,19 @@ func (m tuiModel) activeReply() *ChatMessage {
 
 // previewText collapses whitespace and newlines so a quote fits on one line.
 func previewText(value string) string {
-	return strings.Join(strings.Fields(value), " ")
+	return strings.Join(strings.Fields(sanitizeText(value)), " ")
+}
+
+func sanitizeText(value string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\n' {
+			return r
+		}
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, value)
 }
 
 func scheduleRefresh() tea.Cmd {
@@ -787,9 +879,9 @@ func scheduleRefresh() tea.Cmd {
 
 func chatTitle(chat Chat) string {
 	if chat.Title != "" {
-		return chat.Title
+		return sanitizeText(chat.Title)
 	}
-	return chat.JID
+	return sanitizeText(chat.JID)
 }
 
 func digitsOnly(value string) string {
@@ -811,22 +903,17 @@ func trimLastRune(value string) string {
 }
 
 func truncate(value string, width int) string {
+	value = sanitizeText(value)
 	if width <= 0 {
 		return ""
 	}
-	runes := []rune(value)
-	if len(runes) <= width {
-		return value
-	}
-	if width == 1 {
-		return "…"
-	}
-	return string(runes[:width-1]) + "…"
+	return runewidth.Truncate(value, width, "…")
 }
 
 func wrapText(value string, width int) []string {
-	if width < 8 {
-		width = 8
+	value = sanitizeText(value)
+	if width < 1 {
+		width = 1
 	}
 	var result []string
 	for _, paragraph := range strings.Split(value, "\n") {
@@ -837,15 +924,28 @@ func wrapText(value string, width int) []string {
 		}
 		line := ""
 		for _, word := range words {
+			for runewidth.StringWidth(word) > width {
+				if line != "" {
+					result = append(result, line)
+					line = ""
+				}
+				chunk := runewidth.Truncate(word, width, "")
+				if chunk == "" {
+					// A single wide grapheme cannot fit a one-cell viewport.
+					chunk = word
+				}
+				result = append(result, chunk)
+				word = word[len(chunk):]
+			}
 			if line == "" {
-				line = truncate(word, width)
+				line = word
 				continue
 			}
-			if utf8.RuneCountInString(line)+1+utf8.RuneCountInString(word) <= width {
+			if runewidth.StringWidth(line)+1+runewidth.StringWidth(word) <= width {
 				line += " " + word
 			} else {
 				result = append(result, line)
-				line = truncate(word, width)
+				line = word
 			}
 		}
 		result = append(result, line)
@@ -854,12 +954,12 @@ func wrapText(value string, width int) []string {
 }
 
 func visibleLen(value string) int {
-	return utf8.RuneCountInString(ansiEscape.ReplaceAllString(value, ""))
+	return runewidth.StringWidth(ansiEscape.ReplaceAllString(value, ""))
 }
 
 func fitANSI(value string, width int) string {
 	plain := ansiEscape.ReplaceAllString(value, "")
-	visible := utf8.RuneCountInString(plain)
+	visible := runewidth.StringWidth(plain)
 	if visible > width {
 		// Renderers interpret ANSI sequences; truncation is only used for the
 		// footer and left column, so strip style rather than cut an escape code.

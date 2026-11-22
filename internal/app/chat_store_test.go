@@ -43,6 +43,23 @@ func TestChatStorePersistsAndSortsChats(t *testing.T) {
 	}
 }
 
+func TestChatStoreBreaksTimestampTiesDeterministically(t *testing.T) {
+	now := time.Now()
+	store := &ChatStore{chats: make(map[string]*Chat)}
+	for i := 0; i < 20; i++ {
+		jid := string(rune('a' + i))
+		store.chats[jid] = &Chat{JID: jid, UpdatedAt: now}
+	}
+	for attempt := 0; attempt < 5; attempt++ {
+		chats := store.Chats()
+		for i, chat := range chats {
+			if want := string(rune('a' + i)); chat.JID != want {
+				t.Fatalf("equal timestamps produced unstable order at attempt %d index %d: got %q, want %q", attempt, i, chat.JID, want)
+			}
+		}
+	}
+}
+
 func TestChatStoreIgnoresDuplicateMessageIDs(t *testing.T) {
 	store, err := OpenChatStore(filepath.Join(t.TempDir(), "chats.json"))
 	if err != nil {

@@ -28,6 +28,26 @@ func TestIsSourceDir(t *testing.T) {
 	}
 }
 
+func TestDataDirectory(t *testing.T) {
+	custom := filepath.Join(t.TempDir(), "portable-data")
+	t.Setenv("WHATSFUWA_DATA_DIR", custom)
+	got, err := dataDirectory()
+	if err != nil || got != custom {
+		t.Fatalf("dataDirectory override = %q, %v; want %q", got, err, custom)
+	}
+
+	t.Setenv("WHATSFUWA_DATA_DIR", "")
+	base, err := os.UserConfigDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err = dataDirectory()
+	want := filepath.Join(base, "whatsfuwa")
+	if err != nil || got != want {
+		t.Fatalf("dataDirectory default = %q, %v; want %q", got, err, want)
+	}
+}
+
 func TestBuildVersionWithoutVCSInfo(t *testing.T) {
 	if v := buildVersion(); v == "" {
 		t.Fatal("version must not be empty")
