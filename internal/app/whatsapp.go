@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,6 +14,8 @@ import (
 	"github.com/mdp/qrterminal/v3"
 	"go.mau.fi/whatsmeow"
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/proto/waHistorySync"
+	"go.mau.fi/whatsmeow/proto/waWeb"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -91,6 +94,63 @@ func waitForQRLogin(qrChan <-chan whatsmeow.QRChannelItem, output io.Writer) err
 	return nil
 }
 
+type historyRequestBuilder func(*types.MessageInfo, int) *waE2E.Message
+type peerMessageSender func(context.Context, *waE2E.Message) (whatsmeow.SendResponse, error)
+type historyMessageParser func(types.JID, *waWeb.WebMessageInfo) (*events.Message, error)
+
+func (w *WhatsAppClient) RequestHistory(ctx context.Context, chatJID types.JID) error {
+	if !w.Client.IsConnected() {
+		return fmt.Errorf("WhatsFuwa belum terhubung ke WhatsApp")
+	}
+	return requestHistory(ctx, w.store, chatJID, w.Client.BuildHistorySyncRequest, w.Client.SendPeerMessage)
+}
+
+func requestHistory(ctx context.Context, store *ChatStore, chatJID types.JID, build historyRequestBuilder, send peerMessageSender) error {
+	var oldest *ChatMessage
+	for _, chat := range store.Chats() {
+		if chat.JID == chatJID.String() && len(chat.Messages) > 0 {
+			oldest = &chat.Messages[0]
+			break
+		}
+	}
+	if oldest == nil {
+		return fmt.Errorf("belum ada pesan acuan untuk meminta riwayat")
+	}
+	info := &types.MessageInfo{
+		MessageSource: types.MessageSource{Chat: chatJID, IsFromMe: oldest.FromMe},
+		ID:            types.MessageID(oldest.ID), Timestamp: oldest.Timestamp,
+	}
+	_, err := send(ctx, build(info, 50))
+	return err
+}
+
+func (w *WhatsAppClient) handleHistorySync(data *waHistorySync.HistorySync, parse historyMessageParser) error {
+	if data == nil {
+		return nil
+	}
+	var firstErr error
+	for _, conversation := range data.GetConversations() {
+		chatJID, err := types.ParseJID(conversation.GetID())
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		for _, historyMessage := range conversation.GetMessages() {
+			event, err := parse(chatJID, historyMessage.GetMessage())
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			w.handleEvent(event)
+		}
+	}
+	return firstErr
+}
+
 func (w *WhatsAppClient) Disconnect() {
 	w.Client.Disconnect()
 }
@@ -107,7 +167,10 @@ func (w *WhatsAppClient) SendText(ctx context.Context, jid types.JID, text strin
 		return false, fmt.Errorf("pesan tidak boleh kosong")
 	}
 	if !w.Client.IsConnected() {
-		return false, fmt.Errorf("WhatsFuwa belum terhubung ke WhatsApp")
+		if _, err := w.store.EnqueueText(jid, text, reply); err != nil {
+			return false, fmt.Errorf("menyimpan outbox: %w", err)
+		}
+		return false, ErrOutboxQueued
 	}
 	return deliverText(ctx, w.store, jid, text, reply, func(ctx context.Context, jid types.JID, message *waE2E.Message) (whatsmeow.SendResponse, error) {
 		return w.Client.SendMessage(ctx, jid, message)
@@ -117,6 +180,10 @@ func (w *WhatsAppClient) SendText(ctx context.Context, jid types.JID, text strin
 type sendMessageFunc func(context.Context, types.JID, *waE2E.Message) (whatsmeow.SendResponse, error)
 
 func deliverText(ctx context.Context, store *ChatStore, jid types.JID, text string, reply *ChatMessage, send sendMessageFunc) (bool, error) {
+	return deliverTextWithID(ctx, store, jid, text, reply, "", send)
+}
+
+func deliverTextWithID(ctx context.Context, store *ChatStore, jid types.JID, text string, reply *ChatMessage, messageID types.MessageID, send sendMessageFunc) (bool, error) {
 	message := &waE2E.Message{Conversation: proto.String(text)}
 	replyID, replyPreview := "", ""
 	if reply != nil && reply.ID != "" {
@@ -141,22 +208,9 @@ func deliverText(ctx context.Context, store *ChatStore, jid types.JID, text stri
 		replyPreview = reply.Text
 	}
 
-	resp, err := send(ctx, jid, message)
-	if err != nil {
-		return false, err
-	}
-	if err := store.AddMessage(ChatMessage{
-		ID:           string(resp.ID),
-		ChatJID:      jid.String(),
-		Text:         text,
-		Timestamp:    resp.Timestamp,
-		FromMe:       true,
-		ReplyToID:    replyID,
-		ReplyPreview: replyPreview,
-	}, ""); err != nil {
-		return true, fmt.Errorf("menyimpan cache pesan terkirim: %w", err)
-	}
-	return true, nil
+	return deliverOutgoing(ctx, store, jid, outgoingMessage{
+		message: message, text: text, replyID: replyID, replyPreview: replyPreview, id: messageID,
+	}, send)
 }
 
 func (w *WhatsAppClient) handleEvent(raw any) {
@@ -167,12 +221,54 @@ func (w *WhatsAppClient) handleEvent(raw any) {
 		w.ready.Store(false)
 	case *events.LoggedOut:
 		w.ready.Store(false)
+	case *events.Receipt:
+		ids := make([]string, 0, len(evt.MessageIDs))
+		for _, id := range evt.MessageIDs {
+			ids = append(ids, string(id))
+		}
+		switch evt.Type {
+		case types.ReceiptTypeDelivered:
+			w.logCacheError(w.store.SetDelivery(evt.Chat.String(), ids, DeliveryDelivered))
+		case types.ReceiptTypeRead:
+			w.logCacheError(w.store.SetDelivery(evt.Chat.String(), ids, DeliveryRead))
+		case types.ReceiptTypePlayed:
+			w.logCacheError(w.store.SetDelivery(evt.Chat.String(), ids, DeliveryPlayed))
+		case types.ReceiptTypeReadSelf:
+			w.logCacheError(w.store.MarkIncomingRead(evt.Chat.String(), ids))
+		}
+	case *events.DeleteForMe:
+		w.logCacheError(w.store.DeleteMessage(evt.ChatJID.String(), evt.MessageID))
+	case *events.HistorySync:
+		if err := w.handleHistorySync(evt.Data, w.Client.ParseWebMessage); err != nil && w.logger != nil {
+			w.logger.Errorf("gagal memproses riwayat: %v", err)
+		}
 	case *events.Message:
 		if evt.Message == nil {
 			return
 		}
+		if reaction := evt.Message.GetReactionMessage(); reaction != nil {
+			chatJID := reaction.GetKey().GetRemoteJID()
+			if chatJID == "" {
+				chatJID = evt.Info.Chat.String()
+			}
+			w.logCacheError(w.store.SetReaction(chatJID, reaction.GetKey().GetID(), evt.Info.Sender.String(), reaction.GetText()))
+			return
+		}
+		if protocol := evt.Message.GetProtocolMessage(); protocol != nil && protocol.GetType() == waE2E.ProtocolMessage_REVOKE {
+			chatJID := protocol.GetKey().GetRemoteJID()
+			if chatJID == "" {
+				chatJID = evt.Info.Chat.String()
+			}
+			w.logCacheError(w.store.DeleteMessage(chatJID, protocol.GetKey().GetID()))
+			return
+		}
+		_, mediaKind, mediaMIME := mediaContent(evt.Message)
+		labelType := evt.Info.MediaType
+		if labelType == "" {
+			labelType = mediaKind
+		}
 		text := messageText(evt.Message)
-		if label := mediaLabel(evt.Info.MediaType); label != "" {
+		if label := mediaLabel(labelType); label != "" {
 			if text == "" {
 				text = label
 			} else {
@@ -182,6 +278,10 @@ func (w *WhatsAppClient) handleEvent(raw any) {
 		if text == "" {
 			return
 		}
+		if evt.IsEdit {
+			w.logCacheError(w.store.EditMessage(evt.Info.Chat.String(), string(evt.Info.ID), text))
+			return
+		}
 		title := evt.Info.PushName
 		sender := evt.Info.Sender.String()
 		if evt.Info.IsGroup {
@@ -189,6 +289,14 @@ func (w *WhatsAppClient) handleEvent(raw any) {
 			title = "" // PushName adalah nama pengirim, bukan nama grup.
 		}
 		replyID, replyPreview := replyInfo(evt.Message)
+		delivery := DeliveryNone
+		if evt.Info.IsFromMe {
+			delivery = DeliverySent
+		}
+		var rawMessage []byte
+		if mediaKind != "" {
+			rawMessage, _ = proto.Marshal(evt.Message)
+		}
 		err := w.store.AddMessage(ChatMessage{
 			ID:           string(evt.Info.ID),
 			ChatJID:      evt.Info.Chat.String(),
@@ -199,6 +307,11 @@ func (w *WhatsAppClient) handleEvent(raw any) {
 			FromMe:       evt.Info.IsFromMe,
 			ReplyToID:    replyID,
 			ReplyPreview: replyPreview,
+			Unread:       !evt.Info.IsFromMe && evt.SourceWebMsg == nil,
+			Delivery:     delivery,
+			RawMessage:   rawMessage,
+			MediaType:    mediaKind,
+			MediaMIME:    mediaMIME,
 		}, title)
 		w.logCacheError(err)
 		if evt.Info.IsGroup {
@@ -231,6 +344,53 @@ func (w *WhatsAppClient) logCacheError(err error) {
 	if err != nil && w.logger != nil {
 		w.logger.Errorf("gagal menyimpan cache chat: %v", err)
 	}
+}
+
+type markReadFunc func(context.Context, []types.MessageID, time.Time, types.JID, types.JID) error
+
+func (w *WhatsAppClient) MarkChatRead(ctx context.Context, chatJID types.JID) error {
+	if !w.Client.IsConnected() {
+		return fmt.Errorf("WhatsFuwa belum terhubung ke WhatsApp")
+	}
+	return markChatRead(ctx, w.store, chatJID, func(ctx context.Context, ids []types.MessageID, timestamp time.Time, chat, sender types.JID) error {
+		return w.Client.MarkRead(ctx, ids, timestamp, chat, sender)
+	})
+}
+
+func markChatRead(ctx context.Context, store *ChatStore, chatJID types.JID, mark markReadFunc) error {
+	groups := make(map[string][]types.MessageID)
+	for _, chat := range store.Chats() {
+		if chat.JID != chatJID.String() {
+			continue
+		}
+		for _, message := range chat.Messages {
+			if message.Unread && !message.Deleted {
+				groups[message.SenderJID] = append(groups[message.SenderJID], types.MessageID(message.ID))
+			}
+		}
+	}
+	if len(groups) == 0 {
+		return nil
+	}
+	senders := make([]string, 0, len(groups))
+	for sender := range groups {
+		senders = append(senders, sender)
+	}
+	sort.Strings(senders)
+	for _, sender := range senders {
+		var senderJID types.JID
+		var err error
+		if chatJID.Server == types.GroupServer {
+			senderJID, err = types.ParseJID(sender)
+			if err != nil {
+				return fmt.Errorf("alamat pengirim tidak valid: %w", err)
+			}
+		}
+		if err := mark(ctx, groups[sender], time.Now(), chatJID, senderJID); err != nil {
+			return err
+		}
+	}
+	return store.MarkChatRead(chatJID.String())
 }
 
 func messageText(msg *waE2E.Message) string {

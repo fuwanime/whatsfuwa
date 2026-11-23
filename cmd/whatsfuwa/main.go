@@ -31,6 +31,16 @@ func main() {
 		case "help", "-h", "--help":
 			printHelp()
 			return
+		case "media":
+			if err := runMedia(os.Args[2:], false); err != nil {
+				log.Fatal(err)
+			}
+			return
+		case "media-preview":
+			if err := runMedia(os.Args[2:], true); err != nil {
+				log.Fatal(err)
+			}
+			return
 		default:
 			fmt.Fprintf(os.Stderr, "perintah tidak dikenal: %q\n\n", os.Args[1])
 			printHelp()

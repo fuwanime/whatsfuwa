@@ -2,14 +2,20 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"os/exec"
 	"regexp"
+	"runtime"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
 	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
+	xansi "github.com/charmbracelet/x/ansi"
 	"github.com/mattn/go-runewidth"
 	"go.mau.fi/whatsmeow/types"
 )
@@ -34,6 +40,8 @@ const (
 	focusList
 	focusSearch
 	focusNewChat
+	focusMessage
+	focusAttachment
 )
 
 type UI struct {
@@ -48,27 +56,76 @@ type tuiModel struct {
 	width  int
 	height int
 
-	chats        []Chat
-	selectedJID  string
-	selectedIdx  int
-	listOffset   int
-	scrollOffset int
+	chats             []Chat
+	selectedJID       string
+	selectedMessageID string
+	selectedIdx       int
+	listOffset        int
+	scrollOffset      int
 
 	compose    string
 	filter     string
 	newChat    string
+	attachPath string
+	attaching  bool
 	searchOpen bool
 	creating   bool
 	focus      focusTarget
 	// reply is the message the next sent message will quote, or nil.
-	reply         *ChatMessage
-	pendingDrafts map[string]sendResultMsg
+	reply           *ChatMessage
+	pendingDrafts   map[string]sendResultMsg
+	readInFlight    bool
+	lastReadAttempt time.Time
+	historyPending  map[string]bool
 
 	toast      string
 	toastIsErr bool
 }
 
 type refreshMsg time.Time
+
+type readResultMsg struct {
+	jid string
+	err error
+}
+
+type historyResultMsg struct {
+	jid string
+	err error
+}
+
+type mediaAction uint8
+
+const (
+	mediaDownloadOnly mediaAction = iota
+	mediaPreview
+	mediaOpenExternal
+)
+
+type mediaResultMsg struct {
+	message ChatMessage
+	action  mediaAction
+	path    string
+	err     error
+}
+
+type mediaOpenResultMsg struct {
+	path string
+	err  error
+}
+
+type attachmentResultMsg struct {
+	jid     string
+	path    string
+	caption string
+	sent    bool
+	err     error
+}
+
+type outboxResultMsg struct {
+	sent int
+	err  error
+}
 
 type sendResultMsg struct {
 	jid   string
@@ -131,10 +188,93 @@ func (m tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 
 	case refreshMsg:
 		m.refreshChats()
-		return m, scheduleRefresh()
+		return m, tea.Batch(scheduleRefresh(), m.markReadCmd())
+
+	case readResultMsg:
+		m.readInFlight = false
+		if msg.err != nil {
+			m.setToast("Gagal menandai pesan dibaca: "+msg.err.Error(), true)
+		} else {
+			m.refreshChats()
+		}
+		return m, nil
+
+	case historyResultMsg:
+		delete(m.historyPending, msg.jid)
+		if msg.err != nil {
+			m.setToast("Gagal meminta riwayat: "+msg.err.Error(), true)
+		} else {
+			m.setToast("Riwayat diminta. Pesan lama akan muncul setelah diterima.", false)
+		}
+		return m, nil
+
+	case mediaResultMsg:
+		m.refreshChats()
+		if msg.path == "" {
+			m.setToast("Gagal mengunduh media: "+msg.err.Error(), true)
+			return m, nil
+		}
+		if msg.err != nil {
+			m.setToast(msg.err.Error(), true)
+		}
+		switch msg.action {
+		case mediaPreview:
+			if msg.message.MediaType == "image" || msg.message.MediaType == "sticker" {
+				return m.previewMedia(msg.path)
+			}
+			return m.openMedia(msg.path)
+		case mediaOpenExternal:
+			return m.openMedia(msg.path)
+		default:
+			m.setToast("Media tersimpan di "+msg.path, false)
+			return m, nil
+		}
+
+	case mediaOpenResultMsg:
+		if msg.err != nil {
+			m.setToast("Gagal membuka media: "+msg.err.Error()+". File: "+msg.path, true)
+		} else {
+			m.setToast("Media dibuka: "+msg.path, false)
+		}
+		return m, nil
+
+	case attachmentResultMsg:
+		if !msg.sent {
+			if m.selectedJID == msg.jid {
+				m.attaching = true
+				m.attachPath = msg.path
+				m.focus = focusAttachment
+			}
+			m.setToast("Gagal mengirim lampiran: "+msg.err.Error(), true)
+			return m, nil
+		}
+		m.refreshChats()
+		if m.compose == msg.caption {
+			m.compose = ""
+		}
+		m.reply = nil
+		if msg.err != nil {
+			m.setToast("Lampiran terkirim, tetapi gagal menyimpan cache: "+msg.err.Error(), true)
+		} else {
+			m.setToast("Lampiran terkirim", false)
+		}
+		return m, nil
+
+	case outboxResultMsg:
+		m.refreshChats()
+		if msg.err != nil {
+			m.setToast(fmt.Sprintf("Outbox: %d terkirim; sisanya perlu review: %v", msg.sent, msg.err), true)
+		} else {
+			m.setToast(fmt.Sprintf("Outbox: %d pesan terkirim", msg.sent), false)
+		}
+		return m, nil
 
 	case sendResultMsg:
 		if !msg.sent {
+			if errors.Is(msg.err, ErrOutboxQueued) {
+				m.setToast("Offline: pesan disimpan di outbox. Ctrl+O untuk retry saat online.", false)
+				return m, nil
+			}
 			m.restoreDraft(msg)
 			m.setToast("Gagal mengirim: "+msg.err.Error(), true)
 			return m, nil
@@ -267,7 +407,9 @@ func (m tuiModel) renderHeader(width int) string {
 func (m tuiModel) renderSubheader(width int) string {
 	left := fmt.Sprintf("  %sCHATS%s  %d", ansiBold, ansiReset, len(m.chats))
 	right := "  CONVERSATION"
-	if m.searchOpen {
+	if m.attaching {
+		right = "  ATTACHMENT"
+	} else if m.searchOpen {
 		right = "  SEARCH  / " + m.filter + "▏"
 	} else if m.creating {
 		right = "  NEW CONVERSATION"
@@ -311,7 +453,11 @@ func (m tuiModel) renderChatList(width, height int) []string {
 			marker = "▸ "
 			style = ansiSelect
 		}
-		first := marker + truncate(name, width-13) + "  " + chat.UpdatedAt.Local().Format("15:04")
+		badge := ""
+		if chat.Unread > 0 {
+			badge = fmt.Sprintf(" [%d]", chat.Unread)
+		}
+		first := marker + truncate(name, width-13-len(badge)) + "  " + chat.UpdatedAt.Local().Format("15:04") + badge
 		second := "  " + ansiDim + truncate(preview, width-4) + ansiReset
 		if style != "" {
 			first = style + first + ansiReset
@@ -323,6 +469,18 @@ func (m tuiModel) renderChatList(width, height int) []string {
 }
 
 func (m tuiModel) renderConversation(width, height int) []string {
+	if m.attaching {
+		rows := []string{
+			"",
+			ansiBold + "  Kirim lampiran" + ansiReset,
+			"",
+			"  Masukkan path file yang ingin dikirim.",
+			"  Ukuran maksimum 64 MiB. Caption memakai teks di composer.",
+			"",
+			ansiDim + "  Enter: kirim · Esc: batal" + ansiReset,
+		}
+		return padRows(rows, height)
+	}
 	if m.creating {
 		rows := []string{
 			"",
@@ -349,7 +507,7 @@ func (m tuiModel) renderConversation(width, height int) []string {
 		return padRows(rows, height)
 	}
 
-	messageLines := conversationLines(chat, width)
+	messageLines := conversationLines(chat, width, m.selectedMessageID)
 	maxOffset := maxConversationOffset(len(messageLines), height)
 	offset := minInt(maxOffset, maxInt(0, m.scrollOffset))
 	visibleHeight := height
@@ -365,7 +523,7 @@ func (m tuiModel) renderConversation(width, height int) []string {
 	return padRows(visible, height)
 }
 
-func conversationLines(chat Chat, width int) []string {
+func conversationLines(chat Chat, width int, selectedMessageID string) []string {
 	messageLines := make([]string, 0, len(chat.Messages)*3)
 	for _, message := range chat.Messages {
 		name := message.Sender
@@ -375,11 +533,19 @@ func conversationLines(chat Chat, width int) []string {
 			name = chatTitle(chat)
 		}
 		timestamp := message.Timestamp.Local().Format("15:04")
-		if message.FromMe {
-			messageLines = append(messageLines, ansiCyan+"  Kamu  ·  "+timestamp+ansiReset)
-		} else {
-			messageLines = append(messageLines, ansiBold+"  "+truncate(name, maxInt(8, width-10))+ansiReset+ansiDim+"  ·  "+timestamp+ansiReset)
+		if message.Edited {
+			timestamp += " · diedit"
 		}
+		header := ""
+		if message.FromMe {
+			header = ansiCyan + "  Kamu  ·  " + timestamp + deliveryLabel(message.Delivery) + ansiReset
+		} else {
+			header = ansiBold + "  " + truncate(name, maxInt(8, width-10)) + ansiReset + ansiDim + "  ·  " + timestamp + ansiReset
+		}
+		if message.ID == selectedMessageID {
+			header = ansiSelect + "▸ " + header + ansiReset
+		}
+		messageLines = append(messageLines, header)
 		if message.ReplyToID != "" {
 			quoted := previewText(message.ReplyPreview)
 			if quoted == "" {
@@ -387,9 +553,16 @@ func conversationLines(chat Chat, width int) []string {
 			}
 			messageLines = append(messageLines, ansiDim+"  ↪ "+truncate(quoted, maxInt(12, width-8))+ansiReset)
 		}
-		wrapped := wrapText(message.Text, maxInt(12, width-5))
-		for _, line := range wrapped {
-			messageLines = append(messageLines, "  "+line)
+		if message.Deleted {
+			messageLines = append(messageLines, ansiDim+"  [Pesan dihapus]"+ansiReset)
+		} else {
+			wrapped := wrapText(message.Text, maxInt(12, width-5))
+			for _, line := range wrapped {
+				messageLines = append(messageLines, "  "+line)
+			}
+		}
+		if reactions := reactionSummary(message.Reactions); reactions != "" {
+			messageLines = append(messageLines, "  "+reactions)
 		}
 		messageLines = append(messageLines, "")
 	}
@@ -399,6 +572,40 @@ func conversationLines(chat Chat, width int) []string {
 	return messageLines
 }
 
+func deliveryLabel(status DeliveryStatus) string {
+	switch status {
+	case DeliverySent:
+		return " · ✓"
+	case DeliveryDelivered:
+		return " · ✓✓"
+	case DeliveryRead:
+		return " · ✓✓ dibaca"
+	case DeliveryPlayed:
+		return " · dimainkan"
+	default:
+		return ""
+	}
+}
+
+func reactionSummary(reactions map[string]string) string {
+	counts := make(map[string]int)
+	for _, emoji := range reactions {
+		if emoji != "" {
+			counts[emoji]++
+		}
+	}
+	ordered := make([]string, 0, len(counts))
+	for emoji := range counts {
+		ordered = append(ordered, emoji)
+	}
+	sort.Strings(ordered)
+	parts := make([]string, 0, len(ordered))
+	for _, emoji := range ordered {
+		parts = append(parts, fmt.Sprintf("%s %d", emoji, counts[emoji]))
+	}
+	return strings.Join(parts, " · ")
+}
+
 func (m tuiModel) maxScrollOffset() int {
 	chat, ok := m.selectedChat()
 	if !ok {
@@ -406,7 +613,7 @@ func (m tuiModel) maxScrollOffset() int {
 	}
 	width := maxInt(76, m.width)
 	height := maxInt(3, maxInt(18, m.height)-8)
-	lines := conversationLines(chat, width-leftWidthFor(width)-3)
+	lines := conversationLines(chat, width-leftWidthFor(width)-3, m.selectedMessageID)
 	return maxConversationOffset(len(lines), height)
 }
 
@@ -425,14 +632,18 @@ func (m tuiModel) renderComposer(width int) string {
 	label := "  > "
 	value := m.compose
 	button := "[ Send ]"
-	if m.creating {
+	if m.attaching {
+		label = "  File > "
+		value = m.attachPath
+		button = "[ Attach ]"
+	} else if m.creating {
 		label = "  Nomor > "
 		value = m.newChat
 		button = "[ Create ]"
 	} else if reply := m.activeReply(); reply != nil {
 		label = "  ↪ " + truncate(previewText(reply.Text), 24) + " > "
 	}
-	if m.focus == focusComposer || m.focus == focusNewChat {
+	if m.focus == focusComposer || m.focus == focusNewChat || m.focus == focusAttachment {
 		label = ansiCyan + label + ansiReset
 	}
 	available := width - visibleLen(label) - len(button) - 3
@@ -440,7 +651,9 @@ func (m tuiModel) renderComposer(width int) string {
 		available = 8
 	}
 	placeholder := "Tulis pesan..."
-	if m.creating {
+	if m.attaching {
+		placeholder = "/path/file.png"
+	} else if m.creating {
 		placeholder = "628123456789"
 	}
 	if value == "" {
@@ -457,6 +670,12 @@ func (m tuiModel) renderComposer(width int) string {
 
 func (m tuiModel) renderStatus(width int) string {
 	message := "  WhatsFuwa · Go + whatsmeow · klik chat untuk membuka"
+	if m.ui != nil && m.ui.store != nil && len(m.ui.store.Outbox()) > 0 {
+		message = fmt.Sprintf("  Outbox: %d pesan · Ctrl+O retry manual", len(m.ui.store.Outbox()))
+	}
+	if m.focus == focusMessage {
+		message = "  Pesan: r reply · c copy · d download · v preview · o buka · Esc kembali"
+	}
 	if m.toast != "" {
 		color := ansiGreen
 		if m.toastIsErr {
@@ -530,8 +749,11 @@ func (m tuiModel) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		index := m.listOffset + (msg.Y-contentTop)/2
 		if index >= 0 && index < len(chats) {
 			m.selectedJID = chats[index].JID
+			m.selectedMessageID = ""
 			m.creating = false
 			m.newChat = ""
+			m.attaching = false
+			m.attachPath = ""
 			m.searchOpen = false
 			m.filter = ""
 			m.scrollOffset = 0
@@ -541,6 +763,9 @@ func (m tuiModel) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if msg.Y == footerDivider+1 {
+		if msg.X >= width-len("[ Attach ]")-2 && m.attaching {
+			return m.sendAttachmentCurrent()
+		}
 		if msg.X >= width-len("[ Create ]")-2 && m.creating {
 			m.createChat()
 			return m, nil
@@ -573,8 +798,29 @@ func (m tuiModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+n":
 		m.beginNewChat()
 		return m, nil
+	case "ctrl+g":
+		m.startMessageSelection()
+		return m, nil
+	case "ctrl+h":
+		return m.requestHistory()
+	case "ctrl+a":
+		m.beginAttachment()
+		return m, nil
+	case "ctrl+o":
+		return m.retryOutbox()
 	}
 	if msg.Type == tea.KeyEsc {
+		if m.attaching || m.focus == focusAttachment {
+			m.attaching = false
+			m.attachPath = ""
+			m.focus = focusComposer
+			return m, nil
+		}
+		if m.focus == focusMessage {
+			m.focus = focusComposer
+			m.selectedMessageID = ""
+			return m, nil
+		}
 		if m.creating {
 			m.creating = false
 			m.newChat = ""
@@ -594,7 +840,9 @@ func (m tuiModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	if msg.Type == tea.KeyUp {
-		if m.focus == focusComposer && m.compose == "" {
+		if m.focus == focusMessage {
+			m.moveMessageSelection(-1)
+		} else if m.focus == focusComposer && m.compose == "" {
 			m.moveSelection(-1)
 		} else if m.focus == focusList {
 			m.moveSelection(-1)
@@ -602,7 +850,9 @@ func (m tuiModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if msg.Type == tea.KeyDown {
-		if m.focus == focusComposer && m.compose == "" {
+		if m.focus == focusMessage {
+			m.moveMessageSelection(1)
+		} else if m.focus == focusComposer && m.compose == "" {
 			m.moveSelection(1)
 		} else if m.focus == focusList {
 			m.moveSelection(1)
@@ -622,6 +872,43 @@ func (m tuiModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.focus = focusComposer
 		} else {
 			m.focus = focusList
+		}
+		return m, nil
+	}
+
+	if m.attaching || m.focus == focusAttachment {
+		switch msg.Type {
+		case tea.KeyEnter:
+			return m.sendAttachmentCurrent()
+		case tea.KeyBackspace:
+			m.attachPath = trimLastRune(m.attachPath)
+		case tea.KeyRunes:
+			m.attachPath += string(msg.Runes)
+		}
+		return m, nil
+	}
+
+	if m.focus == focusMessage {
+		if msg.Type == tea.KeyEnter || (msg.Type == tea.KeyRunes && string(msg.Runes) == "r") {
+			m.replyToSelectedMessage()
+			return m, nil
+		}
+		if msg.Type == tea.KeyRunes {
+			switch string(msg.Runes) {
+			case "c":
+				message, ok := m.selectedMessage()
+				if !ok {
+					return m, nil
+				}
+				m.setToast("Teks disalin lewat clipboard terminal", false)
+				return m, tea.Printf("%s", xansi.SetSystemClipboard(message.Text))
+			case "d":
+				return m.runMediaAction(mediaDownloadOnly)
+			case "v":
+				return m.runMediaAction(mediaPreview)
+			case "o":
+				return m.runMediaAction(mediaOpenExternal)
+			}
 		}
 		return m, nil
 	}
@@ -673,6 +960,115 @@ func (m tuiModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m tuiModel) requestHistory() (tea.Model, tea.Cmd) {
+	chat, ok := m.selectedChat()
+	if !ok || len(chat.Messages) == 0 {
+		m.setToast("Belum ada pesan acuan untuk meminta riwayat", true)
+		return m, nil
+	}
+	if m.historyPending[chat.JID] {
+		m.setToast("Permintaan riwayat chat ini masih berjalan", false)
+		return m, nil
+	}
+	if m.ui == nil || m.ui.wa == nil || m.ui.wa.Client == nil {
+		m.setToast("WhatsFuwa belum terhubung", true)
+		return m, nil
+	}
+	jid, err := types.ParseJID(chat.JID)
+	if err != nil {
+		m.setToast("Alamat chat tidak valid: "+err.Error(), true)
+		return m, nil
+	}
+	if m.historyPending == nil {
+		m.historyPending = make(map[string]bool)
+	}
+	m.historyPending[chat.JID] = true
+	m.setToast("Meminta 50 pesan lama dari ponsel...", false)
+	ctx := m.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return m, func() tea.Msg {
+		historyCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+		defer cancel()
+		return historyResultMsg{jid: chat.JID, err: m.ui.wa.RequestHistory(historyCtx, jid)}
+	}
+}
+
+func (m *tuiModel) beginAttachment() {
+	if _, ok := m.selectedChat(); !ok {
+		m.setToast("Pilih chat sebelum melampirkan file", true)
+		return
+	}
+	m.attaching = true
+	m.attachPath = ""
+	m.creating = false
+	m.searchOpen = false
+	m.focus = focusAttachment
+}
+
+func (m tuiModel) sendAttachmentCurrent() (tea.Model, tea.Cmd) {
+	path := strings.TrimSpace(m.attachPath)
+	if len(path) >= 2 && ((path[0] == '"' && path[len(path)-1] == '"') || (path[0] == '\'' && path[len(path)-1] == '\'')) {
+		path = path[1 : len(path)-1]
+	}
+	if path == "" {
+		return m, nil
+	}
+	chat, ok := m.selectedChat()
+	if !ok {
+		m.setToast("Pilih chat terlebih dahulu", true)
+		return m, nil
+	}
+	jid, err := types.ParseJID(chat.JID)
+	if err != nil {
+		m.setToast("Alamat chat tidak valid: "+err.Error(), true)
+		return m, nil
+	}
+	if m.ui == nil || m.ui.wa == nil || m.ui.wa.Client == nil || !m.ui.wa.Client.IsConnected() {
+		m.setToast("WhatsFuwa belum terhubung", true)
+		return m, nil
+	}
+	caption := m.compose
+	reply := m.activeReply()
+	m.attaching = false
+	m.attachPath = ""
+	m.focus = focusComposer
+	m.setToast("Mengunggah lampiran...", false)
+	ctx := m.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return m, func() tea.Msg {
+		sendCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+		defer cancel()
+		sent, err := m.ui.wa.SendAttachment(sendCtx, jid, path, caption, reply)
+		return attachmentResultMsg{jid: chat.JID, path: path, caption: caption, sent: sent, err: err}
+	}
+}
+
+func (m tuiModel) retryOutbox() (tea.Model, tea.Cmd) {
+	if m.ui == nil || m.ui.store == nil || len(m.ui.store.Outbox()) == 0 {
+		m.setToast("Outbox kosong", false)
+		return m, nil
+	}
+	if m.ui.wa == nil || m.ui.wa.Client == nil {
+		m.setToast("WhatsFuwa belum terhubung", true)
+		return m, nil
+	}
+	m.setToast("Mengirim ulang outbox...", false)
+	ctx := m.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return m, func() tea.Msg {
+		retryCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+		defer cancel()
+		sent, err := m.ui.wa.RetryOutbox(retryCtx)
+		return outboxResultMsg{sent: sent, err: err}
+	}
+}
+
 func (m tuiModel) sendCurrent() (tea.Model, tea.Cmd) {
 	text := strings.TrimSpace(m.compose)
 	if text == "" {
@@ -688,7 +1084,7 @@ func (m tuiModel) sendCurrent() (tea.Model, tea.Cmd) {
 		m.setToast("Alamat chat tidak valid: "+err.Error(), true)
 		return m, nil
 	}
-	if !m.ui.wa.IsConnected() {
+	if m.ui == nil || m.ui.wa == nil || m.ui.wa.Client == nil {
 		m.setToast("WhatsFuwa belum terhubung", true)
 		return m, nil
 	}
@@ -732,6 +1128,8 @@ func (m *tuiModel) createChat() {
 func (m *tuiModel) beginSearch() {
 	m.creating = false
 	m.newChat = ""
+	m.attaching = false
+	m.attachPath = ""
 	m.searchOpen = true
 	m.focus = focusSearch
 }
@@ -739,10 +1137,37 @@ func (m *tuiModel) beginSearch() {
 func (m *tuiModel) beginNewChat() {
 	m.creating = true
 	m.newChat = ""
+	m.attaching = false
+	m.attachPath = ""
 	m.searchOpen = false
 	m.filter = ""
 	m.focus = focusNewChat
 	m.refreshChats()
+}
+
+func (m *tuiModel) markReadCmd() tea.Cmd {
+	if m.readInFlight || time.Since(m.lastReadAttempt) < 15*time.Second || m.ui == nil || m.ui.wa == nil || m.ui.wa.Client == nil {
+		return nil
+	}
+	chat, ok := m.selectedChat()
+	if !ok || chat.Unread == 0 {
+		return nil
+	}
+	jid, err := types.ParseJID(chat.JID)
+	if err != nil {
+		return nil
+	}
+	m.readInFlight = true
+	m.lastReadAttempt = time.Now()
+	ctx := m.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return func() tea.Msg {
+		readCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+		return readResultMsg{jid: chat.JID, err: m.ui.wa.MarkChatRead(readCtx, jid)}
+	}
 }
 
 func (m *tuiModel) refreshChats() {
@@ -751,6 +1176,7 @@ func (m *tuiModel) refreshChats() {
 	m.chats = m.ui.store.Find(m.filter)
 	if len(m.chats) == 0 {
 		m.selectedJID = ""
+		m.selectedMessageID = ""
 		m.selectedIdx = 0
 		m.listOffset = 0
 		return
@@ -765,6 +1191,7 @@ func (m *tuiModel) refreshChats() {
 	}
 	m.selectedIdx = 0
 	m.selectedJID = m.chats[0].JID
+	m.selectedMessageID = ""
 	m.listOffset = 0
 }
 
@@ -798,6 +1225,7 @@ func (m *tuiModel) moveSelection(delta int) {
 	}
 	m.selectedIdx = index
 	m.selectedJID = chats[index].JID
+	m.selectedMessageID = ""
 	m.scrollOffset = 0
 	m.keepListSelectionVisible()
 }
@@ -821,6 +1249,155 @@ func (m *tuiModel) setToast(value string, isErr bool) {
 	m.toastIsErr = isErr
 }
 
+func (m tuiModel) runMediaAction(action mediaAction) (tea.Model, tea.Cmd) {
+	message, ok := m.selectedMessage()
+	if !ok || message.MediaType == "" {
+		m.setToast("Pesan yang dipilih bukan media", true)
+		return m, nil
+	}
+	if message.MediaPath != "" {
+		if info, err := os.Stat(message.MediaPath); err == nil && info.Mode().IsRegular() {
+			return m, func() tea.Msg {
+				return mediaResultMsg{message: message, action: action, path: message.MediaPath}
+			}
+		}
+	}
+	if m.ui == nil || m.ui.wa == nil || m.ui.wa.Client == nil {
+		m.setToast("WhatsFuwa belum terhubung untuk mengunduh media", true)
+		return m, nil
+	}
+	m.setToast("Mengunduh media...", false)
+	ctx := m.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return m, func() tea.Msg {
+		downloadCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+		defer cancel()
+		path, err := m.ui.wa.DownloadMedia(downloadCtx, message)
+		return mediaResultMsg{message: message, action: action, path: path, err: err}
+	}
+}
+
+func (m tuiModel) previewMedia(path string) (tea.Model, tea.Cmd) {
+	if DetectImageProtocol(os.Getenv) == ImageNone {
+		return m.openMedia(path)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		m.setToast("Menemukan binary preview: "+err.Error(), true)
+		return m, nil
+	}
+	command := exec.Command(executable, "media-preview", path)
+	return m, tea.ExecProcess(command, func(err error) tea.Msg {
+		return mediaOpenResultMsg{path: path, err: err}
+	})
+}
+
+func (m tuiModel) openMedia(path string) (tea.Model, tea.Cmd) {
+	return m, func() tea.Msg {
+		var command *exec.Cmd
+		switch runtime.GOOS {
+		case "darwin":
+			command = exec.Command("open", path)
+		case "windows":
+			command = exec.Command("rundll32", "url.dll,FileProtocolHandler", path)
+		default:
+			command = exec.Command("xdg-open", path)
+		}
+		if err := command.Start(); err != nil {
+			return mediaOpenResultMsg{path: path, err: err}
+		}
+		_ = command.Process.Release()
+		return mediaOpenResultMsg{path: path}
+	}
+}
+
+func (m *tuiModel) startMessageSelection() {
+	chat, ok := m.selectedChat()
+	if !ok || len(chat.Messages) == 0 {
+		m.setToast("Tidak ada pesan untuk dipilih", true)
+		return
+	}
+	m.selectedMessageID = chat.Messages[len(chat.Messages)-1].ID
+	m.scrollOffset = 0
+	m.focus = focusMessage
+	m.creating = false
+	m.attaching = false
+	m.attachPath = ""
+	m.searchOpen = false
+}
+
+func (m *tuiModel) moveMessageSelection(delta int) {
+	chat, ok := m.selectedChat()
+	if !ok || len(chat.Messages) == 0 {
+		return
+	}
+	index := len(chat.Messages) - 1
+	for i, message := range chat.Messages {
+		if message.ID == m.selectedMessageID {
+			index = i
+			break
+		}
+	}
+	index = minInt(len(chat.Messages)-1, maxInt(0, index+delta))
+	m.selectedMessageID = chat.Messages[index].ID
+	m.keepSelectedMessageVisible(chat)
+}
+
+func (m *tuiModel) keepSelectedMessageVisible(chat Chat) {
+	width := maxInt(76, m.width)
+	height := maxInt(3, maxInt(18, m.height)-8)
+	lines := conversationLines(chat, width-leftWidthFor(width)-3, m.selectedMessageID)
+	selectedLine := -1
+	for i, line := range lines {
+		if strings.Contains(line, "▸ ") {
+			selectedLine = i
+			break
+		}
+	}
+	if selectedLine < 0 {
+		return
+	}
+	visibleHeight := height
+	if m.scrollOffset > 0 {
+		visibleHeight = maxInt(1, height-1)
+	}
+	end := len(lines) - m.scrollOffset
+	start := maxInt(0, end-visibleHeight)
+	if selectedLine >= end {
+		m.scrollOffset = len(lines) - selectedLine - 1
+	} else if selectedLine < start {
+		m.scrollOffset = len(lines) - selectedLine - visibleHeight
+	}
+	m.scrollOffset = minInt(maxConversationOffset(len(lines), height), maxInt(0, m.scrollOffset))
+}
+
+func (m tuiModel) selectedMessage() (ChatMessage, bool) {
+	chat, ok := m.selectedChat()
+	if !ok {
+		return ChatMessage{}, false
+	}
+	for _, message := range chat.Messages {
+		if message.ID == m.selectedMessageID {
+			return message, true
+		}
+	}
+	return ChatMessage{}, false
+}
+
+func (m *tuiModel) replyToSelectedMessage() {
+	message, ok := m.selectedMessage()
+	if !ok {
+		m.setToast("Pilih pesan terlebih dahulu", true)
+		return
+	}
+	target := message
+	m.reply = &target
+	m.focus = focusComposer
+	m.setToast("Membalas pesan. Esc untuk batal.", false)
+}
+
 // startReply makes the newest incoming message in the selected chat the
 // target of the next sent message.
 func (m *tuiModel) startReply() {
@@ -836,6 +1413,7 @@ func (m *tuiModel) startReply() {
 		}
 		target := message
 		m.reply = &target
+		m.selectedMessageID = target.ID
 		m.focus = focusComposer
 		m.setToast("Membalas pesan. Esc untuk batal.", false)
 		return

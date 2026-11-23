@@ -8,15 +8,16 @@
 
 WhatsFuwa adalah klien WhatsApp satu akun berbasis Go dan [`whatsmeow`](https://github.com/tulir/whatsmeow). Antarmukanya berupa TUI full-screen dengan daftar chat, panel percakapan, dan kolom pesan—tanpa browser, Chromium, atau Node.js.
 
-> **Status: MVP untuk pemakaian pribadi.** Fokus saat ini adalah chat teks dan balasan. Media ditampilkan sebagai label, bukan diunduh.
+> **Status: MVP untuk pemakaian pribadi.** Mendukung chat teks, lampiran, riwayat on-demand, reaksi, read receipt, dan outbox offline. Preview gambar tersedia melalui Kitty graphics protocol dan Sixel pada terminal yang kompatibel.
 
 ## Fitur utama
 
 - **Tetap terhubung:** pairing QR, sesi login tersimpan, dan reconnect otomatis.
-- **Chat yang familiar:** kirim/baca pesan teks, balas dengan kutipan, dan lihat nama grup.
-- **Keyboard dan mouse:** pilih chat, cari percakapan, buat chat baru, dan scroll riwayat.
-- **Ringan secara default:** tidak mengunduh arsip chat penuh atau file media secara otomatis.
-- **Cache terbatas:** menyimpan maksimal 80 chat dan 30 pesan per chat di perangkat.
+- **Percakapan lengkap:** kirim/baca teks, reply, edit/hapus/reaction, unread counter, serta delivery/read receipt.
+- **Media:** unduh media masuk, kirim lampiran hingga 64 MiB, dan preview gambar dengan Kitty atau Sixel.
+- **Riwayat on-demand:** minta 50 pesan lama dari ponsel tanpa mengunduh arsip penuh saat login.
+- **Produktif di terminal:** seleksi pesan, reply/copy, keyboard dan mouse, serta pencarian judul/JID.
+- **Outbox offline:** antrean teks tersimpan dengan ID stabil dan retry manual yang konservatif.
 
 ## Instalasi
 
@@ -118,7 +119,11 @@ Peluncuran berikutnya memakai sesi tersimpan selama perangkat masih tertaut. Jik
 | `Ctrl+F` | Cari nama atau JID chat |
 | `Ctrl+N` | Buat chat baru |
 | `Ctrl+R` | Balas pesan masuk terbaru di chat yang dipilih |
-| `Esc` | Batalkan balasan atau tutup form aktif |
+| `Ctrl+G` | Masuk mode seleksi pesan |
+| `Ctrl+H` | Minta 50 pesan lama dari ponsel |
+| `Ctrl+A` | Lampirkan file |
+| `Ctrl+O` | Retry outbox secara manual |
+| `Esc` | Batalkan balasan atau tutup form/mode aktif |
 | `PgUp` / `PgDn` | Scroll riwayat pesan |
 | `Tab` | Pindah fokus antara daftar chat dan kolom pesan |
 | `Ctrl+C` | Keluar |
@@ -137,6 +142,58 @@ Peluncuran berikutnya memakai sesi tersimpan selama perangkat masih tertaut. Jik
 
 Untuk chat baru, masukkan nomor dalam format internasional, misalnya `628123456789`. Windows Terminal, GNOME Terminal, Konsole, dan terminal modern lain umumnya mendukung mouse reporting; keyboard tetap tersedia sebagai fallback.
 
+### Aksi pada pesan terpilih
+
+Tekan `Ctrl+G`, lalu gunakan `↑` / `↓` untuk memilih pesan. Tampilan akan menggulir otomatis agar pesan tetap terlihat.
+
+| Tombol | Aksi |
+| --- | --- |
+| `r` atau `Enter` | Reply pesan terpilih |
+| `c` | Copy teks melalui clipboard terminal (OSC 52) |
+| `d` | Unduh media dan tampilkan path lokal |
+| `v` | Preview gambar melalui Kitty/Sixel, atau buka media lain secara eksternal |
+| `o` | Buka media dengan aplikasi eksternal |
+| `Esc` | Keluar dari mode seleksi |
+
+## Riwayat dan media
+
+### Riwayat on-demand
+
+`Ctrl+H` meminta 50 pesan yang berada tepat sebelum pesan tertua di cache. Ponsel harus online dan chat harus sudah memiliki satu pesan acuan. Response diproses sebagai `HISTORY_SYNC_ON_DEMAND`, diurutkan berdasarkan timestamp, dan dideduplikasi berdasarkan message ID. Arsip awal tetap tidak diunduh otomatis saat login.
+
+### Mengunduh dan mengirim media
+
+- `d` pada pesan media mengunduh file secara on-demand ke folder `media/` dalam direktori data.
+- `Ctrl+A` membuka form lampiran. Masukkan path file; teks yang sudah ada di composer dipakai sebagai caption bila tipe media mendukungnya.
+- Image, video, audio, dan dokumen dibuat dari tipe MIME. Tipe lain dikirim sebagai dokumen.
+- Batas unduhan dan lampiran adalah **64 MiB per file**. Audio tidak mendukung caption pada jalur ini.
+
+### Preview Kitty dan Sixel
+
+Preview mendukung PNG, JPEG, dan GIF (frame pertama). Untuk format lain atau terminal yang tidak dikenali, WhatsFuwa membuka file melalui aplikasi eksternal.
+
+| Nilai `WHATSFUWA_IMAGE_PROTOCOL` | Perilaku |
+| --- | --- |
+| `auto` (default) | Kitty untuk Kitty/Ghostty/Konsole/WezTerm; Sixel untuk TERM yang dikenali seperti `xterm-sixel`, `mlterm`, `foot`, atau `contour` |
+| `kitty` | Paksa Kitty graphics protocol |
+| `sixel` | Paksa Sixel |
+| `none` | Jangan preview di terminal; gunakan aplikasi eksternal |
+
+Deteksi otomatis berbasis environment terminal, bukan negosiasi kemampuan terminal. Pada xterm atau terminal lain yang dikompilasi dengan dukungan khusus, pilih protokol secara eksplisit. Preview dari TUI berjalan melalui perintah `media-preview`; TUI kembali setelah pengguna menekan Enter.
+
+Perintah manual:
+
+```bash
+WHATSFUWA_IMAGE_PROTOCOL=kitty whatsfuwa media ./foto.png
+WHATSFUWA_IMAGE_PROTOCOL=sixel whatsfuwa media ./foto.png
+```
+
+## Outbox offline
+
+Jika pengiriman teks gagal pada preflight karena koneksi belum tersedia, pesan disimpan dalam outbox di `chats.json` bersama reply dan client-generated message ID. Tekan `Ctrl+O` untuk retry setelah online.
+
+Outbox sengaja **tidak melakukan auto-retry untuk error ambigu** seperti timeout. Error tersebut tetap berada dalam antrean untuk review manual agar pesan tidak terduplikasi. Retry memakai `SendRequestExtra.ID` yang sama; pesan yang sudah diterima server dikeluarkan dari antrean. Lampiran belum masuk outbox.
+
 ## Perintah
 
 | Perintah | Fungsi |
@@ -144,6 +201,7 @@ Untuk chat baru, masukkan nomor dalam format internasional, misalnya `6281234567
 | `whatsfuwa` | Buka aplikasi |
 | `whatsfuwa update` | Tarik source dengan `git pull --ff-only`, lalu build ulang |
 | `whatsfuwa version` | Tampilkan commit Git tempat binary dibangun |
+| `whatsfuwa media FILE` | Preview gambar melalui Kitty atau Sixel |
 | `whatsfuwa help` | Tampilkan bantuan |
 
 Source untuk update dicari dari `WHATSFUWA_SRC`, `~/.whatsfuwa/src`, folder saat ini, lalu folder binary. Di Windows, binary baru disimpan sebagai `whatsfuwa.exe.new`; tutup aplikasi lalu ganti binary lama secara manual.
@@ -167,7 +225,8 @@ WHATSFUWA_DATA_DIR="$HOME/.local/share/whatsfuwa" whatsfuwa
 Isi folder data:
 
 - `session.db` — sesi perangkat tertaut dan material autentikasi.
-- `chats.json` — cache percakapan dan cuplikan pesan dalam JSON yang tidak dienkripsi oleh WhatsFuwa.
+- `chats.json` — cache percakapan, reaksi, delivery state, dan outbox dalam JSON yang tidak dienkripsi oleh WhatsFuwa.
+- `media/` — file yang diunduh on-demand dengan nama hash dan permission privat.
 
 > **Seluruh isi folder data bersifat sensitif.** Jangan bagikan, upload, atau commit folder ini, termasuk file tambahan SQLite seperti WAL. Folder `./data` pada source tetap diabaikan Git untuk kompatibilitas lama; folder override lain tidak otomatis diabaikan.
 
@@ -187,9 +246,11 @@ Alternatifnya, arahkan `WHATSFUWA_DATA_DIR` ke folder data lama.
 ## Batasan saat ini
 
 - Dibuat untuk **satu akun dan satu instance** pada folder sesi yang sama. Jangan menjalankan dua instance pada database sesi yang sama.
-- Pengiriman berfokus pada teks dan kutipan. Foto, video, dokumen, audio, dan stiker hanya muncul sebagai label beserta caption yang tersedia; file tidak diunduh.
-- Riwayat lama tidak diunduh otomatis. Daftar chat terisi dari cache lokal serta pesan baru yang diterima atau dikirim.
-- Cache menyimpan maksimal 80 chat dan 30 pesan per chat. Teks yang melebihi 1.200 karakter Unicode dipotong dan diberi tanda elipsis.
+- Arsip awal tidak diunduh otomatis. Riwayat tambahan hanya diminta melalui `Ctrl+H` dan memerlukan ponsel online.
+- Cache menyimpan maksimal 80 chat dan 500 pesan per chat. Teks yang melebihi 1.200 karakter Unicode dipotong dan diberi tanda elipsis.
+- Preview gambar bergantung pada dukungan protokol terminal dan decoder PNG/JPEG/GIF. Terminal lain tetap memakai aplikasi eksternal.
+- Outbox hanya untuk pesan teks yang gagal sebelum network call. Timeout atau kegagalan dengan status penerimaan tidak jelas tidak dicoba ulang otomatis.
+- `ReactionMessage` biasa sudah didukung; `EncReactionMessage` yang memerlukan dekripsi tambahan belum diproses.
 - WhatsFuwa memakai library komunitas nonresmi. Perubahan protokol WhatsApp dapat memutus sesi atau mengubah perilaku aplikasi.
 
 ## Troubleshooting
@@ -241,6 +302,10 @@ go vet ./...
 - Bubble Tea menangani input keyboard dan mouse di terminal.
 - `whatsmeow` dipilih untuk scope satu akun yang lebih sederhana; HyperMeow tidak digunakan pada MVP ini.
 - Tidak ada Chromium, Selenium, atau browser penuh.
+
+## Roadmap
+
+Rencana pengembangan berikutnya dan status verifikasinya tercatat di [`ROADMAP.md`](ROADMAP.md).
 
 ## Catatan penggunaan
 

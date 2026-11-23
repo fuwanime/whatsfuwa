@@ -132,6 +132,7 @@ Penggunaan:
   whatsfuwa            Buka aplikasi
   whatsfuwa update     Ambil pembaruan dari git dan bangun ulang
   whatsfuwa version    Tampilkan versi
+  whatsfuwa media FILE Preview gambar via Kitty/Sixel
   whatsfuwa help       Tampilkan bantuan ini
 `)
 }
